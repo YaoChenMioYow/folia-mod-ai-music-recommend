@@ -21,6 +21,9 @@ const RECENT_CAP = 80;          // 最近播放环形缓冲
 const SEARCH_LIMIT = 15;        // 每条推荐在音源里搜几条候选(热门歌翻唱多,候选太窄会错过指定歌手的版本)
 const RESOLVE_POOL = 4;         // 并发搜索数（omni 限额：每模组 120 次/分、并发 8）
 const CLEAR_ARM_MS = 4000;      // 「清除历史」两次点击的确认窗口
+const RESULTS_CAP = 60;         // 推荐列表在页面上保留的最大行数（电台追加会不断变长）
+const RADIO_RUNWAY_MIN = 2;     // 队列里当前歌之后不足这个数就开始补充下一批
+const RADIO_COOLDOWN_MS = 60000; // 一批补充颗粒无收时的冷却
 
 const say = {
   needUrl: '先在模组设置里填写 OpenAI 兼容接口地址',
@@ -219,9 +222,11 @@ export default function activate(folium) {
   const onSongChanged = () => {
     finalizeCurrent();
     const song = (() => { try { return playback.getState()?.song ?? null; } catch { return null; } })();
-    if (!song || !song.ref) { current = null; return; }
+    if (!song || !song.ref) { current = null; radioTick(); return; }
     const dto = songSnapshot(song);
     current = { key: keyOf(dto), dto, since: Date.now(), counted: false };
+    // 换歌即检查电台跑道：歌与歌的间隙是补充下一批的最佳时机。
+    radioTick();
   };
 
   const tickPlayback = () => {
@@ -744,11 +749,14 @@ export default function activate(folium) {
     return rows;
   };
 
-  const generate = async ({ announce = false } = {}) => {
-    if (busy) return 0;
+  /** 生成一批推荐。append=true 时新行追加在现有列表后面（电台补充用），
+   *  并把新行数组返回给调用方，由它自己 await 解析完成后再处理；普通模式
+   *  返回新行数量，解析在后台自动进行。 */
+  const generate = async ({ announce = false, append = false } = {}) => {
+    if (busy) return append ? [] : 0;
     const cfg = readSettings();
-    if (!cfg.apiUrl) { toast(say.needUrl, 'error'); return 0; }
-    if (!(await hasKey())) { toast(say.needKey, 'error'); return 0; }
+    if (!cfg.apiUrl) { toast(say.needUrl, 'error'); return append ? [] : 0; }
+    if (!(await hasKey())) { toast(say.needKey, 'error'); return append ? [] : 0; }
 
     busy = true;
     statusText = say.generating;
@@ -771,6 +779,16 @@ export default function activate(folium) {
       const want = Number.isFinite(cfg.recommendCount) ? Math.max(1, cfg.recommendCount) : 8;
       const rows = sanitizeSongs(songs, want);
       if (rows.length === 0) throw new Error(say.noSongs);
+      if (append) {
+        // 追加模式：电台在列表尾部续写，页面上能看到推荐不断累积。
+        const known = new Set(results.map((row) => `${row.title}\u0000${row.artist}`));
+        const fresh = rows.filter((row) => !known.has(`${row.title}\u0000${row.artist}`));
+        results = [...results, ...fresh].slice(-RESULTS_CAP);
+        statusText = say.generated(fresh.length);
+        await saveResults();
+        render();
+        return fresh;
+      }
       results = rows;
       resolvedThisSession = false;
       statusText = say.generated(rows.length);
@@ -783,7 +801,7 @@ export default function activate(folium) {
       statusText = `${say.generateFailed}：${String(error?.message ?? error).slice(0, 160)}`;
       render();
       if (announce) toast(statusText, 'error');
-      return 0;
+      return append ? [] : 0;
     } finally {
       busy = false;
       void refreshKeyStatus();
@@ -800,6 +818,191 @@ export default function activate(folium) {
       log.warn?.('清除听歌历史失败', error);
     }
     render();
+  };
+
+  // ---------------------------------------------------------------- 推荐电台
+
+  /* 「推荐电台」：持续播放 AI 推荐的守护会话。开启时立刻开播当前推荐列表，
+   *  之后每次换歌和定时 tick 都检查队列「跑道」——当前歌之后剩余不足
+   *  RADIO_RUNWAY_MIN 首时，在歌放完之前生成下一批推荐并追加进队列，无缝
+   *  衔接。只用 playback.enqueue/playSong（playback.control 权限），不动
+   *  replaceQueue，不接管用户的队列：用户自己的歌排在前面就先放完它们。 */
+
+  const radioKeyOf = (song) => `${String(song?.source ?? '')}\u0000${String(song?.id ?? '')}`;
+
+  /** 读完整条队列（分页），返回 {seen, length, currentIndex, kind}；舞台等
+   *  非 queue 上下文返回 null。 */
+  const readQueueKeys = () => {
+    const seen = new Set();
+    let offset = 0;
+    for (let page = 0; page < 4; page += 1) {
+      let head;
+      try { head = playback.getQueue({ offset, limit: 500 }); } catch { return null; }
+      if (!head || head.kind !== 'queue') return null;
+      const items = Array.isArray(head.items) ? head.items : [];
+      const length = Number(head.length) || 0;
+      for (const item of items) {
+        if (item?.song) seen.add(radioKeyOf(item.song));
+      }
+      offset += items.length;
+      if (offset >= length || items.length === 0) {
+        return { seen, length, currentIndex: Number.isFinite(head.currentIndex) ? head.currentIndex : -1 };
+      }
+    }
+    return { seen, length: offset, currentIndex: -1 };
+  };
+
+  let radio = null; // null=关闭；{busy, cooldownUntil, sessionKeys}
+  const radioListeners = new Set();
+  const notifyRadio = () => {
+    for (const listener of [...radioListeners]) {
+      try { listener(); } catch { /* 面板已经被移除 */ }
+    }
+  };
+
+  const stopRadio = (message) => {
+    if (!radio) return;
+    radio = null;
+    notifyRadio();
+    toast(message ?? tr('推荐电台已关闭，当前队列保持不变', 'Radio off; the queue is left as it is'), 'info');
+  };
+
+  /** 收集可见列表里「可进电台」的行：匹配成功、歌手也对得上。 */
+  const playableRowsOf = () => results.filter((row) => row.status === 'found' && row.song && !row.mismatch);
+
+  /** 开启电台：立刻开播推荐列表（第一首 playSong，其余 enqueue），之后由
+   *  守护 tick 持续补充。 */
+  const startRadio = async () => {
+    if (radio) { stopRadio(); return; }
+    if (busy) { toast(tr('正在生成推荐，稍候再开电台', 'Still generating; try again in a moment'), 'info'); return; }
+    const queueInfo = readQueueKeys();
+    if (!queueInfo) {
+      toast(tr('当前播放上下文不支持推荐电台', 'Radio is not available in this playback context'), 'error');
+      return;
+    }
+    radio = { busy: true, cooldownUntil: 0, sessionKeys: new Set() };
+    notifyRadio();
+    try {
+      let playable = playableRowsOf();
+      // 列表里还有没解析完的行：先补齐再挑。
+      if (results.some((row) => row.status === 'pending')) {
+        await resolveAll({ allowAutoEnqueue: false });
+        if (!radio || disposed) return;
+        playable = playableRowsOf();
+      }
+      // 列表里没有可播的：现场生成一批。
+      if (playable.length === 0) {
+        const freshRows = await generate({ announce: false, append: true });
+        if (!radio || disposed) return;
+        if (!Array.isArray(freshRows) || freshRows.length === 0) {
+          stopRadio(tr('没拿到推荐：请检查 AI 接口设置后再开电台', 'No recommendations available; check the AI settings'));
+          return;
+        }
+        await resolveAll({ allowAutoEnqueue: false });
+        if (!radio || disposed) return;
+        playable = playableRowsOf();
+      }
+      if (playable.length === 0) {
+        stopRadio(tr('音源里没匹配到可播放的推荐，电台没有开启', 'No playable matches; radio not started'));
+        return;
+      }
+      // 开播第一首（跳过队列里已有的），其余追加。
+      const first = playable.find((row) => !queueInfo.seen.has(radioKeyOf(row.song))) ?? playable[0];
+      await playback.playSong(first.song);
+      radio.sessionKeys.add(radioKeyOf(first.song));
+      let added = 0;
+      for (const row of playable) {
+        if (row === first) continue;
+        const key = radioKeyOf(row.song);
+        if (queueInfo.seen.has(key) || radio.sessionKeys.has(key)) continue;
+        try {
+          if (await playback.enqueue(row.song) === true) {
+            radio.sessionKeys.add(key);
+            queueInfo.seen.add(key);
+            added += 1;
+          }
+        } catch { /* 单首失败不影响整体 */ }
+      }
+      toast(tr(
+        `推荐电台已开启：正在播放推荐列表${added > 0 ? `（${added} 首已排入队列）` : ''}，队列快放完时会自动补充新推荐`,
+        `Radio on: playing the list${added > 0 ? `, ${added} enqueued` : ''}; more recommendations are added before the queue runs out`,
+      ), 'success');
+    } catch (error) {
+      radio = null;
+      log.warn?.('推荐电台开启失败', error);
+      toast(`${tr('电台没能开启', 'Radio failed to start')}：${String(error?.message ?? error).slice(0, 120)}`, 'error');
+    } finally {
+      if (radio) radio.busy = false;
+      notifyRadio();
+      render();
+    }
+  };
+
+  /** 守护补充：跑道不足就生成下一批、解析、追加进队列。 */
+  const radioTopUp = async () => {
+    if (!radio || disposed || radio.busy) return;
+    if (Date.now() < radio.cooldownUntil) return;
+    radio.busy = true;
+    notifyRadio();
+    try {
+      const queueInfo = readQueueKeys();
+      if (!queueInfo) { stopRadio(); return; }
+      const runway = queueInfo.length - 1 - queueInfo.currentIndex;
+      if (runway >= RADIO_RUNWAY_MIN) return;
+
+      const freshRows = await generate({ announce: false, append: true });
+      if (!radio || disposed) return;
+      if (!Array.isArray(freshRows) || freshRows.length === 0) {
+        radio.cooldownUntil = Date.now() + RADIO_COOLDOWN_MS;
+        return;
+      }
+      await resolveAll({ allowAutoEnqueue: false });
+      if (!radio || disposed) return;
+
+      let added = 0;
+      let firstAdded = null;
+      for (const row of freshRows) {
+        if (row.status !== 'found' || !row.song || row.mismatch) continue;
+        const key = radioKeyOf(row.song);
+        if (queueInfo.seen.has(key) || radio.sessionKeys.has(key)) continue;
+        try {
+          if (await playback.enqueue(row.song) === true) {
+            radio.sessionKeys.add(key);
+            queueInfo.seen.add(key);
+            added += 1;
+            if (!firstAdded) firstAdded = row.song;
+          }
+        } catch { /* 单首失败不影响整体 */ }
+      }
+      if (added === 0) {
+        radio.cooldownUntil = Date.now() + RADIO_COOLDOWN_MS;
+        return;
+      }
+      // 队列放空、播放已经停了：把新补充的第一首直接开播。
+      const state = playback.getState();
+      if (!state?.song && firstAdded) {
+        try { await playback.playSong(firstAdded); } catch { /* 放不了就等用户手动 */ }
+      }
+      toast(tr(`推荐电台：已补充 ${added} 首新推荐进队列`, `Radio: ${added} new recommendations queued`), 'info');
+    } catch (error) {
+      radio.cooldownUntil = Date.now() + RADIO_COOLDOWN_MS;
+      log.warn?.('推荐电台补充失败', error);
+    } finally {
+      if (radio) radio.busy = false;
+      notifyRadio();
+    }
+  };
+
+  const radioTick = () => {
+    if (!radio || disposed) return;
+    if (radio.busy || Date.now() < radio.cooldownUntil) return;
+    // 跑道检查放在 topUp 里做；这里只是低频唤起。
+    void radioTopUp();
+  };
+
+  const toggleRadio = () => {
+    if (radio) stopRadio();
+    else void startRadio();
   };
 
   // ---------------------------------------------------------------- 首页标签页
@@ -932,6 +1135,20 @@ export default function activate(folium) {
         void resolveAll({ allowAutoEnqueue: true });
       });
       btnRow.appendChild(refreshBtn);
+
+      const radioBtn = document.createElement('button');
+      radioBtn.type = 'button';
+      radioBtn.style.cssText = radio
+        ? `${css.ghostBtn} border-color:var(--folium-accent,#fafafa);opacity:1;`
+        : css.ghostBtn;
+      radioBtn.textContent = radio
+        ? (radio.busy
+          ? tr('电台：正在补充推荐…', 'Radio: refilling…')
+          : tr('电台运行中 · 点击关闭', 'Radio on · click to stop'))
+        : tr('播放推荐列表（连播）', 'Play the list (radio)');
+      hover(radioBtn);
+      radioBtn.addEventListener('click', () => { void startRadio(); });
+      btnRow.appendChild(radioBtn);
       card.appendChild(btnRow);
 
       if (statusText) {
@@ -939,6 +1156,16 @@ export default function activate(folium) {
         status.style.cssText = css.dim;
         status.textContent = statusText;
         card.appendChild(status);
+      }
+
+      if (radio) {
+        const radioLine = document.createElement('div');
+        radioLine.style.cssText = css.dim;
+        radioLine.textContent = tr(
+          '推荐电台运行中：当前歌之后队列不足 2 首时，自动生成并追加下一批推荐，无缝衔接。',
+          'Radio running: when fewer than 2 songs remain ahead, the next batch is generated and appended seamlessly.',
+        );
+        card.appendChild(radioLine);
       }
 
       if (!cfg.apiUrl || !cfg.model) {
@@ -1207,6 +1434,20 @@ export default function activate(folium) {
   });
 
   folium.registries.commands.register({
+    id: 'radio',
+    label: T('AI 推荐音乐：推荐电台', 'AI music: recommendation radio'),
+    description: T(
+      '连播 AI 推荐列表：队列快放完时自动生成并追加下一批推荐，无限续播',
+      'Play the AI recommendation list end-to-end, topping the queue up before it runs out',
+    ),
+    keywords: ['ai', '电台', 'radio', '连播', '推荐'],
+    run: () => {
+      void startRadio();
+      return radio ? tr('推荐电台已开启', 'Radio on') : tr('推荐电台已关闭', 'Radio off');
+    },
+  });
+
+  folium.registries.commands.register({
     id: 'clear-history',
     label: T('AI 推荐音乐：清除听歌记录', 'AI music: clear listening history'),
     description: T('删掉这个模组记录的全部听歌数据', 'Delete all listening data recorded by this mod'),
@@ -1219,9 +1460,80 @@ export default function activate(folium) {
 
   // ---------------------------------------------------------------- 接线
 
+  /* 进度条右侧的电台开关：和「心动模式」的开关同款位置，一键连播/停止。 */
+  folium.registries.progressButtons.register({
+    id: 'radio-toggle',
+    slot: 'progress.trailing',
+    order: 450,
+    mount(container, ctx) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.style.cssText = [
+        'all:unset',
+        'cursor:pointer',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'width:24px',
+        'height:24px',
+        'border-radius:7px',
+        'opacity:0.72',
+        'transition:opacity .15s ease,transform .15s ease,color .15s ease',
+        'position:relative',
+      ].join(';');
+      container.appendChild(button);
+
+      let icon = null;
+      const painter = () => {
+        const active = Boolean(radio);
+        const colors = ctx.getColors?.() ?? {};
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.setAttribute('aria-busy', radio?.busy ? 'true' : 'false');
+        button.title = radio
+          ? (radio.busy
+            ? tr('推荐电台：正在补充推荐（点击关闭）', 'Radio: refilling (click to stop)')
+            : tr('推荐电台运行中（点击关闭）', 'Radio running (click to stop)'))
+          : tr('推荐电台：连播 AI 推荐列表', 'Radio: play the AI recommendation list');
+        button.style.color = active ? (colors.fill || '#8b5cf6') : (colors.text || 'currentColor');
+        button.style.opacity = radio?.busy ? '0.45' : '0.72';
+        button.style.transform = radio?.busy ? 'scale(0.9)' : 'scale(1)';
+        if (icon) {
+          icon.style.fill = active ? 'currentColor' : 'none';
+          icon.style.stroke = 'currentColor';
+        }
+      };
+
+      void icon('radio', 15).then((element) => {
+        if (!element) return;
+        icon = element;
+        button.replaceChildren(element);
+        painter();
+      }).catch(() => { /* 图标取不到不影响功能 */ });
+
+      button.addEventListener('mouseenter', () => { if (!radio) button.style.opacity = '1'; });
+      button.addEventListener('mouseleave', () => { if (!radio) button.style.opacity = '0.72'; });
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        toggleRadio();
+      });
+      radioListeners.add(painter);
+      painter();
+      try { ctx?.onChange?.(painter); } catch { /* 老宿主没有 onChange */ }
+      return () => {
+        radioListeners.delete(painter);
+        button.remove();
+      };
+    },
+  });
+
   const unsubscribers = [];
   try { unsubscribers.push(folium.events.on('playback.songChanged', onSongChanged)); } catch (error) { log.warn?.('songChanged 监听失败', error); }
-  try { unsubscribers.push(folium.every(1000, tickPlayback)); } catch (error) { log.warn?.('定时器创建失败', error); }
+  try {
+    unsubscribers.push(folium.every(1000, () => {
+      tickPlayback();
+      radioTick();
+    }));
+  } catch (error) { log.warn?.('定时器创建失败', error); }
   try { unsubscribers.push(settingsSection.settings.onChange(() => { void refreshKeyStatus(); render(); })); } catch { /* 老宿主没有 onChange */ }
 
   // 启动：读历史与上次结果；模组启用时若已有歌在放，把当前歌标成「已计」，
