@@ -1483,7 +1483,7 @@ export default function activate(folium) {
       ].join(';');
       container.appendChild(button);
 
-      let icon = null;
+      let iconEl = null;   // 注意：不能叫 icon——会遮蔽外层的 icon(name,size) 辅助函数
       const painter = () => {
         const active = Boolean(radio);
         const colors = ctx.getColors?.() ?? {};
@@ -1497,15 +1497,15 @@ export default function activate(folium) {
         button.style.color = active ? (colors.fill || '#8b5cf6') : (colors.text || 'currentColor');
         button.style.opacity = radio?.busy ? '0.45' : '0.72';
         button.style.transform = radio?.busy ? 'scale(0.9)' : 'scale(1)';
-        if (icon) {
-          icon.style.fill = active ? 'currentColor' : 'none';
-          icon.style.stroke = 'currentColor';
+        if (iconEl) {
+          iconEl.style.fill = active ? 'currentColor' : 'none';
+          iconEl.style.stroke = 'currentColor';
         }
       };
 
       void icon('radio', 15).then((element) => {
         if (!element) return;
-        icon = element;
+        iconEl = element;
         button.replaceChildren(element);
         painter();
       }).catch(() => { /* 图标取不到不影响功能 */ });
