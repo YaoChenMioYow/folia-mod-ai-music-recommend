@@ -822,37 +822,130 @@ export default function activate(folium) {
 
   // ---------------------------------------------------------------- 推荐电台
 
-  /* 「推荐电台」：持续播放 AI 推荐的守护会话。开启时立刻开播当前推荐列表，
-   *  之后每次换歌和定时 tick 都检查队列「跑道」——当前歌之后剩余不足
-   *  RADIO_RUNWAY_MIN 首时，在歌放完之前生成下一批推荐并追加进队列，无缝
-   *  衔接。只用 playback.enqueue/playSong（playback.control 权限），不动
-   *  replaceQueue，不接管用户的队列：用户自己的歌排在前面就先放完它们。 */
+  /* 「推荐电台」：接管队列的 AI 连播会话（与「心动模式」同款队列语义）。
+   *  开启：快照原歌单 → replaceQueue 换成 [当前歌, ...推荐] → 立刻连播；
+   *  补充：跑道不足时生成下一批，enqueue 追加进队尾（不整表替换）；
+   *  关闭/崩溃/停用：恢复开启前的原歌单（内存 DTO 或快照 + omni.resolveSongs）。
+   *  权限：playback.queue（replaceQueue）+ playback.control（playSong/enqueue）。 */
 
   const radioKeyOf = (song) => `${String(song?.source ?? '')}\u0000${String(song?.id ?? '')}`;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  /** 读完整条队列（分页），返回 {seen, length, currentIndex, kind}；舞台等
-   *  非 queue 上下文返回 null。 */
-  const readQueueKeys = () => {
-    const seen = new Set();
-    let offset = 0;
-    for (let page = 0; page < 4; page += 1) {
+  /** 读完整条队列（分页，版本一致才算数）。非 queue 上下文返回 null。 */
+  const readQueue = () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       let head;
-      try { head = playback.getQueue({ offset, limit: 500 }); } catch { return null; }
+      try { head = playback.getQueue({ offset: 0, limit: 500 }); } catch { return null; }
       if (!head || head.kind !== 'queue') return null;
-      const items = Array.isArray(head.items) ? head.items : [];
-      const length = Number(head.length) || 0;
-      for (const item of items) {
-        if (item?.song) seen.add(radioKeyOf(item.song));
+      const items = [...(Array.isArray(head.items) ? head.items : [])];
+      const version = head.version;
+      let broke = false;
+      while (items.length < (Number(head.length) || 0)) {
+        let page;
+        try { page = playback.getQueue({ offset: items.length, limit: 500 }); } catch { return null; }
+        if (!page || page.version !== version || !Array.isArray(page.items) || page.items.length === 0) { broke = true; break; }
+        items.push(...page.items);
       }
-      offset += items.length;
-      if (offset >= length || items.length === 0) {
-        return { seen, length, currentIndex: Number.isFinite(head.currentIndex) ? head.currentIndex : -1 };
+      if (!broke) {
+        return {
+          songs: items.map((item) => item?.song).filter(Boolean),
+          length: Number(head.length) || items.length,
+          currentIndex: Number.isFinite(head.currentIndex) ? head.currentIndex : -1,
+          version,
+        };
       }
     }
-    return { seen, length: offset, currentIndex: -1 };
+    return null;
   };
 
-  let radio = null; // null=关闭；{busy, cooldownUntil, sessionKeys}
+  /** 队列 key 集合视图（去重用）。 */
+  const readQueueKeys = () => {
+    const head = readQueue();
+    if (!head) return null;
+    return { seen: new Set(head.songs.map(radioKeyOf)), length: head.length, currentIndex: head.currentIndex };
+  };
+
+  /* replaceQueue 有每秒一次的限流和 expectedVersion 校验，这里统一接住：
+   * `stale-version` 交回调用方重读，`rate-limited` 等一会儿再试。 */
+  let lastReplaceAt = 0;
+  const replaceQueueSafe = async (songs, version) => {
+    const gap = Date.now() - lastReplaceAt;
+    if (gap < 1100) await sleep(1100 - gap);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let result;
+      try {
+        result = await playback.replaceQueue(songs, { expectedVersion: version });
+      } catch (error) {
+        return { status: 'refused', reason: String(error?.message ?? error).slice(0, 80) };
+      }
+      lastReplaceAt = Date.now();
+      if (result?.status === 'replaced') return result;
+      if (result?.reason === 'rate-limited') {
+        await sleep(Math.max(1100, Number(result?.retryAfterMs) || 1100));
+        continue;
+      }
+      return result;
+    }
+    return { status: 'refused', reason: 'rate-limited' };
+  };
+
+  /** 按 key 去重保序；只收带宿主 ref 的歌曲 DTO。 */
+  const uniqueSongs = (songs) => {
+    const seen = new Set();
+    const out = [];
+    for (const song of songs) {
+      if (!song?.ref) continue;
+      const key = radioKeyOf(song);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(song);
+    }
+    return out;
+  };
+
+  /** 把数组旋转到 anchor 开头；anchor 不在里面就原样返回。 */
+  const rotateFrom = (songs, anchor) => {
+    if (!anchor) return [...songs];
+    const key = radioKeyOf(anchor);
+    const index = songs.findIndex((song) => radioKeyOf(song) === key);
+    if (index === -1) return [...songs];
+    return [...songs.slice(index), ...songs.slice(0, index)];
+  };
+
+  /** 快照：电台被崩溃/关机打断时，下次启动恢复原歌单用。 */
+  const RADIO_SNAPSHOT_KEY = 'radio-snapshot-v1';
+  const pairOf = (song) => [String(song?.source ?? ''), String(song?.id ?? '')];
+  const persistRadioSnapshot = async (s) => {
+    try {
+      await folium.storage.set(RADIO_SNAPSHOT_KEY, {
+        v: 1,
+        anchor: s.anchorSong ? pairOf(s.anchorSong) : null,
+        songs: s.snapshotPairs,
+        owned: [...s.sessionKeys].map((key) => key.split('\u0000')),
+        savedAt: Date.now(),
+      });
+    } catch (error) { log.warn?.('电台快照没写进去', error); }
+  };
+  const clearRadioSnapshot = () => { void folium.storage.delete(RADIO_SNAPSHOT_KEY).catch(() => {}); };
+
+  /** 一批可移植身份 → 歌曲 DTO（认不出的丢掉）。 */
+  const resolvePairs = async (pairs) => {
+    const keys = (Array.isArray(pairs) ? pairs : [])
+      .filter((pair) => Array.isArray(pair) && pair[0] && pair[1])
+      .map((pair) => ({ source: pair[0], id: pair[1] }));
+    const songs = [];
+    for (let at = 0; at < keys.length; at += 50) {
+      try {
+        const answers = await folium.omni.resolveSongs(keys.slice(at, at + 50));
+        for (const answer of answers ?? []) {
+          if (answer?.status === 'found' && answer.song) songs.push(answer.song);
+        }
+      } catch { /* 一页失败不影响其余 */ }
+    }
+    return songs;
+  };
+
+  let radio = null; // null=关闭；{phase, busy, cooldownUntil, sessionKeys, originalSongs, snapshotPairs, anchorSong, unsubscribe}
   const radioListeners = new Set();
   const notifyRadio = () => {
     for (const listener of [...radioListeners]) {
@@ -860,27 +953,68 @@ export default function activate(folium) {
     }
   };
 
+  /** 关闭会话。restore=true 时尽力把原歌单换回来（崩溃恢复路径也走这里）。 */
+  const endRadioSession = (s, restore) => {
+    if (radio !== s) return;
+    radio = null;
+    try { s.unsubscribe?.(); } catch { /* 已经没了 */ }
+    s.unsubscribe = null;
+    notifyRadio();
+    if (!restore) { clearRadioSnapshot(); return; }
+    void (async () => {
+      const current = playback.getState()?.song ?? null;
+      let original = Array.isArray(s.originalSongs) && s.originalSongs.length > 0 ? s.originalSongs : null;
+      if (!original) original = await resolvePairs(s.snapshotPairs);
+      clearRadioSnapshot();
+      if (!original || original.length === 0) {
+        toast(tr('电台已关闭：开启前没有原歌单可恢复', 'Radio off: no previous queue to restore'), 'info');
+        return;
+      }
+      const head = readQueue();
+      const ordered = rotateFrom(original, s.anchorSong ?? current);
+      const next = uniqueSongs([...(current ? [current] : []), ...ordered]);
+      const result = head ? await replaceQueueSafe(next, head.version) : null;
+      if (result?.status === 'replaced') {
+        toast(tr('推荐电台已关闭，原歌单已恢复', 'Radio off; your previous queue is restored'), 'success');
+      } else {
+        toast(tr('推荐电台已关闭；原歌单没能自动恢复，请手动换回', 'Radio off; auto-restore failed, switch back manually'), 'error');
+      }
+    })().catch((error) => {
+      log.warn?.('恢复原歌单失败', error);
+      clearRadioSnapshot();
+    });
+  };
+
   const stopRadio = (message) => {
     if (!radio) return;
-    radio = null;
-    notifyRadio();
-    toast(message ?? tr('推荐电台已关闭，当前队列保持不变', 'Radio off; the queue is left as it is'), 'info');
+    const s = radio;
+    endRadioSession(s, true);
+    toast(message ?? tr('推荐电台已关闭，正在恢复你原来的歌单…', 'Radio off; restoring your previous queue…'), 'info');
   };
 
   /** 收集可见列表里「可进电台」的行：匹配成功、歌手也对得上。 */
   const playableRowsOf = () => results.filter((row) => row.status === 'found' && row.song && !row.mismatch);
 
-  /** 开启电台：立刻开播推荐列表（第一首 playSong，其余 enqueue），之后由
-   *  守护 tick 持续补充。 */
+  /** 开启电台：快照原歌单，接管队列只播推荐，然后由守护 tick 持续补充。 */
   const startRadio = async () => {
     if (radio) { stopRadio(); return; }
     if (busy) { toast(tr('正在生成推荐，稍候再开电台', 'Still generating; try again in a moment'), 'info'); return; }
-    const queueInfo = readQueueKeys();
-    if (!queueInfo) {
+    const head = readQueue();
+    if (!head) {
       toast(tr('当前播放上下文不支持推荐电台', 'Radio is not available in this playback context'), 'error');
       return;
     }
-    radio = { busy: true, cooldownUntil: 0, sessionKeys: new Set() };
+    const current = playback.getState()?.song ?? null;
+    radio = {
+      phase: 'preparing',
+      busy: true,
+      cooldownUntil: 0,
+      sessionKeys: new Set(),
+      originalSongs: head.songs,
+      snapshotPairs: head.songs.map(pairOf),
+      anchorSong: current,
+      unsubscribe: null,
+    };
     notifyRadio();
     try {
       let playable = playableRowsOf();
@@ -895,7 +1029,8 @@ export default function activate(folium) {
         const freshRows = await generate({ announce: false, append: true });
         if (!radio || disposed) return;
         if (!Array.isArray(freshRows) || freshRows.length === 0) {
-          stopRadio(tr('没拿到推荐：请检查 AI 接口设置后再开电台', 'No recommendations available; check the AI settings'));
+          endRadioSession(radio, false);
+          toast(tr('没拿到推荐：请检查 AI 接口设置后再开电台', 'No recommendations available; check the AI settings'), 'error');
           return;
         }
         await resolveAll({ allowAutoEnqueue: false });
@@ -903,32 +1038,52 @@ export default function activate(folium) {
         playable = playableRowsOf();
       }
       if (playable.length === 0) {
-        stopRadio(tr('音源里没匹配到可播放的推荐，电台没有开启', 'No playable matches; radio not started'));
+        endRadioSession(radio, false);
+        toast(tr('音源里没匹配到可播放的推荐，电台没有开启', 'No playable matches; radio not started'), 'error');
         return;
       }
-      // 开播第一首（跳过队列里已有的），其余追加。
-      const first = playable.find((row) => !queueInfo.seen.has(radioKeyOf(row.song))) ?? playable[0];
-      await playback.playSong(first.song);
-      radio.sessionKeys.add(radioKeyOf(first.song));
-      let added = 0;
-      for (const row of playable) {
-        if (row === first) continue;
-        const key = radioKeyOf(row.song);
-        if (queueInfo.seen.has(key) || radio.sessionKeys.has(key)) continue;
-        try {
-          if (await playback.enqueue(row.song) === true) {
-            radio.sessionKeys.add(key);
-            queueInfo.seen.add(key);
-            added += 1;
-          }
-        } catch { /* 单首失败不影响整体 */ }
+      // 接管队列：[当前歌, ...推荐] 整表替换，原歌单已快照。
+      const currentKey = current ? radioKeyOf(current) : null;
+      const recs = uniqueSongs(playable.map((row) => row.song).filter((song) => !currentKey || radioKeyOf(song) !== currentKey));
+      const next = uniqueSongs([...(current ? [current] : []), ...recs]);
+      const result = await replaceQueueSafe(next, head.version);
+      if (!radio || disposed) return; // 替换期间被关闭：stopRadio 的恢复流程已接管
+      if (result?.status !== 'replaced') {
+        endRadioSession(radio, false);
+        toast(tr(
+          `队列替换被拒绝（${result?.reason ?? 'unknown'}），电台没有开启，原歌单未受影响`,
+          `Queue replace refused (${result?.reason ?? 'unknown'}); radio not started, your queue is untouched`,
+        ), 'error');
+        return;
+      }
+      radio.phase = 'active';
+      for (const song of next) radio.sessionKeys.add(radioKeyOf(song));
+      await persistRadioSnapshot(radio);
+      // 别人（用户、别的模组、宿主）动了队列：电台的歌还在就继续，否则退出且不恢复
+      radio.unsubscribe = folium.events.on('playback.queueChanged', (change) => {
+        const s = radio;
+        if (!s || radio !== s) return;
+        if (change?.byThisMod) { radioTick(); return; }
+        const now = readQueueKeys();
+        const stillOurs = now ? [...s.sessionKeys].some((key) => now.seen.has(key)) : false;
+        if (!stillOurs) {
+          endRadioSession(s, false);
+          toast(tr('队列被接管，推荐电台已退出（不改动当前队列）', 'Queue taken over; radio exited without touching it'), 'info');
+          return;
+        }
+        radioTick();
+      });
+      // 替换不会自动起播：没在放就把推荐的第一首播起来
+      const state = playback.getState();
+      if (!state?.song && next[0]) {
+        try { await playback.playSong(next[0]); } catch { /* 放不了就等用户手动 */ }
       }
       toast(tr(
-        `推荐电台已开启：正在播放推荐列表${added > 0 ? `（${added} 首已排入队列）` : ''}，队列快放完时会自动补充新推荐`,
-        `Radio on: playing the list${added > 0 ? `, ${added} enqueued` : ''}; more recommendations are added before the queue runs out`,
+        `推荐电台已开启：队列已接管，正在连播 ${next.length} 首推荐；关闭电台时会自动恢复你原来的歌单`,
+        `Radio on: queue taken over with ${next.length} recommendations; your previous queue is restored on exit`,
       ), 'success');
     } catch (error) {
-      radio = null;
+      endRadioSession(radio, false);
       log.warn?.('推荐电台开启失败', error);
       toast(`${tr('电台没能开启', 'Radio failed to start')}：${String(error?.message ?? error).slice(0, 120)}`, 'error');
     } finally {
@@ -938,7 +1093,7 @@ export default function activate(folium) {
     }
   };
 
-  /** 守护补充：跑道不足就生成下一批、解析、追加进队列。 */
+  /** 守护补充：跑道不足就生成下一批、解析、追加进队列（enqueue，不整表替换）。 */
   const radioTopUp = async () => {
     if (!radio || disposed || radio.busy) return;
     if (Date.now() < radio.cooldownUntil) return;
@@ -946,7 +1101,7 @@ export default function activate(folium) {
     notifyRadio();
     try {
       const queueInfo = readQueueKeys();
-      if (!queueInfo) { stopRadio(); return; }
+      if (!queueInfo) { endRadioSession(radio, false); return; }
       const runway = queueInfo.length - 1 - queueInfo.currentIndex;
       if (runway >= RADIO_RUNWAY_MIN) return;
 
@@ -1003,6 +1158,38 @@ export default function activate(folium) {
   const toggleRadio = () => {
     if (radio) stopRadio();
     else void startRadio();
+  };
+
+  /** 上一次电台没正常关闭（崩溃/关机）：开机后把原歌单换回去。 */
+  const recoverRadioInterrupted = async () => {
+    let record = null;
+    try { record = await folium.storage.get(RADIO_SNAPSHOT_KEY); } catch { return; }
+    if (!record || record.v !== 1 || !Array.isArray(record.songs) || record.songs.length === 0) return;
+    if (radio) return; // 用户已经自己开了一个
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !disposed && !radio) {
+      const head = readQueue();
+      if (head && head.songs.length > 0) {
+        const owned = new Set((Array.isArray(record.owned) ? record.owned : []).map((p) => `${p?.[0] ?? ''}\u0000${p?.[1] ?? ''}`));
+        const stillOurs = head.songs.some((song) => owned.has(radioKeyOf(song)));
+        clearRadioSnapshot();
+        if (stillOurs) {
+          const current = playback.getState()?.song ?? null;
+          const anchor = Array.isArray(record.anchor) ? { source: record.anchor[0], id: record.anchor[1] } : null;
+          const original = await resolvePairs(record.songs);
+          if (original.length > 0) {
+            const ordered = rotateFrom(original, anchor ?? current);
+            const next = uniqueSongs([...(current ? [current] : []), ...ordered]);
+            const result = await replaceQueueSafe(next, head.version);
+            if (result?.status === 'replaced') {
+              toast(tr('已恢复上次的歌单（电台上次没有正常关闭）', 'Previous queue restored (the radio was interrupted last time)'), 'success');
+            }
+          }
+        }
+        return;
+      }
+      await sleep(600);
+    }
   };
 
   // ---------------------------------------------------------------- 首页标签页
@@ -1162,8 +1349,8 @@ export default function activate(folium) {
         const radioLine = document.createElement('div');
         radioLine.style.cssText = css.dim;
         radioLine.textContent = tr(
-          '推荐电台运行中：当前歌之后队列不足 2 首时，自动生成并追加下一批推荐，无缝衔接。',
-          'Radio running: when fewer than 2 songs remain ahead, the next batch is generated and appended seamlessly.',
+          '推荐电台运行中：队列已接管，当前歌之后不足 2 首时自动补充下一批；关闭电台会自动恢复你原来的歌单。',
+          'Radio running: the queue is taken over; fewer than 2 songs ahead triggers the next batch, and your previous queue is restored on exit.',
         );
         card.appendChild(radioLine);
       }
@@ -1437,8 +1624,8 @@ export default function activate(folium) {
     id: 'radio',
     label: T('AI 推荐音乐：推荐电台', 'AI music: recommendation radio'),
     description: T(
-      '连播 AI 推荐列表：队列快放完时自动生成并追加下一批推荐，无限续播',
-      'Play the AI recommendation list end-to-end, topping the queue up before it runs out',
+      '接管队列连播 AI 推荐：队列快放完时自动生成并追加下一批，无限续播；关闭时恢复原歌单',
+      'Take over the queue with AI recommendations, topping it up forever; the previous queue is restored on exit',
     ),
     keywords: ['ai', '电台', 'radio', '连播', '推荐'],
     run: () => {
@@ -1551,8 +1738,13 @@ export default function activate(folium) {
     log.info('AI 推荐音乐已就绪');
   })();
 
+  // 上一次电台被崩溃/关机打断：把原歌单换回去（有快照才动作）。
+  void recoverRadioInterrupted();
+
   return () => {
     disposed = true;
+    // 模组被停用/重载时电台还开着：把原歌单换回去，别把用户留在电台队列里。
+    if (radio) endRadioSession(radio, true);
     for (const off of unsubscribers) {
       try { off(); } catch { /* 已经没了 */ }
     }
