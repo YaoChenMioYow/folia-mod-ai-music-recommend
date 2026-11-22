@@ -18,7 +18,7 @@ const HISTORY_KEY = 'history-v1';
 const RESULTS_KEY = 'results-v1';
 const HISTORY_CAP = 600;        // 记录的歌数上限（storage 配额 1MB，绰绰有余）
 const RECENT_CAP = 80;          // 最近播放环形缓冲
-const SEARCH_LIMIT = 10;        // 每条推荐在音源里搜几条候选
+const SEARCH_LIMIT = 15;        // 每条推荐在音源里搜几条候选(热门歌翻唱多,候选太窄会错过指定歌手的版本)
 const RESOLVE_POOL = 4;         // 并发搜索数（omni 限额：每模组 120 次/分、并发 8）
 const CLEAR_ARM_MS = 4000;      // 「清除历史」两次点击的确认窗口
 
@@ -499,6 +499,7 @@ export default function activate(folium) {
             song: null,
             error: '',
             enqueued: false,
+            mismatch: false,
           }));
       }
     } catch { /* 没有上次的结果就算了 */ }
@@ -622,6 +623,7 @@ export default function activate(folium) {
   const searchOne = async (row) => {
     row.status = 'searching';
     row.error = '';
+    row.mismatch = false;
     render();
     const query = `${row.title} ${row.artist}`.trim();
     try {
@@ -631,6 +633,10 @@ export default function activate(folium) {
       if (best) {
         row.status = 'found';
         row.song = best;
+        /* 歌手完全对不上：热门歌的翻唱版本被搜到了、但指定歌手的版本不在
+         * 结果里。照旧可播放，但标记出来——展示真实匹配到的歌，且自动入队
+         * 跳过它，不让封面版悄悄混进队列。 */
+        row.mismatch = Boolean(row.artist) && artistScoreOf(row.artist, best.artist ?? '') === 0;
       } else {
         row.status = 'missing';
         row.error = '';
@@ -638,6 +644,7 @@ export default function activate(folium) {
     } catch (error) {
       row.status = 'error';
       row.error = explainOmniError(error);
+      row.mismatch = false;
     }
     render();
   };
@@ -705,7 +712,9 @@ export default function activate(folium) {
       if (disposed || run !== resolveRun) return;
       await searchOne(row);
       if (disposed || run !== resolveRun) return;
-      if (wantEnqueue && row.status === 'found') await enqueueRow(row);
+      // 自动入队只收「歌手也对得上」的匹配：版本不同(翻唱/合集署名差异)的
+      // 行留给用户手动决定，避免封面版悄悄混进队列。
+      if (wantEnqueue && row.status === 'found' && !row.mismatch) await enqueueRow(row);
     })));
 
     if (disposed || run !== resolveRun) return;
@@ -726,6 +735,7 @@ export default function activate(folium) {
         song: null,
         error: '',
         enqueued: false,
+        mismatch: false,
       };
       splitDashTitle(row);
       rows.push(row);
@@ -969,7 +979,13 @@ export default function activate(folium) {
           info.style.cssText = 'flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;';
           const nameLine = document.createElement('div');
           nameLine.style.cssText = 'font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
-          nameLine.textContent = row.artist ? `${row.title} — ${row.artist}` : row.title;
+          const matched = row.status === 'found' && row.song;
+          if (matched) {
+            // 显示实际会播放的那首歌：匹配结果才是真相，不能拿 AI 的原话冒充。
+            nameLine.textContent = row.song.artist ? `${row.song.title} — ${row.song.artist}` : (row.song.title || row.title);
+          } else {
+            nameLine.textContent = row.artist ? `${row.title} — ${row.artist}` : row.title;
+          }
           info.appendChild(nameLine);
           const reasonLine = document.createElement('div');
           reasonLine.style.cssText = css.dimmer;
@@ -982,6 +998,23 @@ export default function activate(folium) {
                 : '';
           reasonLine.textContent = `${row.reason || (row.artist ? '' : tr('（AI 没给歌手名）', '(no artist)'))}${statusNote}`;
           info.appendChild(reasonLine);
+          if (matched && row.mismatch) {
+            const warn = document.createElement('div');
+            warn.style.cssText = css.statusWarn;
+            warn.textContent = tr(
+              `⚠ 音源里没找到「${row.artist}」的版本，已匹配其他歌手；自动入队跳过了这首`,
+              `⚠ ${row.artist}'s version not found; matched another artist, skipped by auto-enqueue`,
+            );
+            info.appendChild(warn);
+          } else if (matched && (row.song.title !== row.title || (row.song.artist ?? '') !== row.artist)) {
+            const note = document.createElement('div');
+            note.style.cssText = css.dimmer;
+            note.textContent = tr(
+              `AI 原推荐：${row.artist ? `${row.title} — ${row.artist}` : row.title}`,
+              `AI suggested: ${row.artist ? `${row.title} — ${row.artist}` : row.title}`,
+            );
+            info.appendChild(note);
+          }
           line.appendChild(info);
 
           const actions = document.createElement('div');
