@@ -96,6 +96,42 @@ export default function activate(folium) {
     .map((name) => name.trim())
     .filter(Boolean);
 
+  /** 歌手熟悉度：从本模组历史 + 「听歌档案」聚合的播放次数。用途：同一首歌
+   *  在音源里有多个歌手的版本（原唱/翻唱/女声版）时，匹配得分里加上「你更常
+   *  听谁」的偏好，让「就让这大雨全都落下」落到你常听的旺仔小乔而不是原唱。
+   *  惰性重建：loadHistory / refreshArchive 后置脏。 */
+  let familiarityMap = new Map();
+  let familiarityDirty = true;
+
+  const markFamiliarityDirty = () => { familiarityDirty = true; };
+
+  const familiarityOf = (artist) => {
+    if (familiarityDirty) {
+      const map = new Map();
+      const bump = (names, plays) => {
+        for (const name of names) {
+          if (!name) continue;
+          map.set(name, (map.get(name) ?? 0) + plays);
+        }
+      };
+      for (const song of Object.values(history.songs ?? {})) bump(splitArtists(song.a), song.p);
+      const archive = archiveProfile;
+      if (archiveLinked() && archive?.status === 'linked') {
+        for (const artist of archive.topArtists ?? []) bump(splitArtists(artist.name), artist.plays ?? 0);
+        for (const song of archive.topSongs ?? []) bump(splitArtists(song.a), song.p ?? 0);
+      }
+      familiarityMap = map;
+      familiarityDirty = false;
+    }
+    if (!artist) return 0;
+    // 候选歌手名的最大熟悉度（候选可能写「旺仔小乔 / 某人」多歌手署名）。
+    let best = 0;
+    for (const name of splitArtists(artist)) {
+      best = Math.max(best, familiarityMap.get(name) ?? 0);
+    }
+    return best;
+  };
+
   // ---------------------------------------------------------------- 听歌历史
 
   let history = { v: 1, songs: {}, recent: [] };
@@ -143,6 +179,7 @@ export default function activate(folium) {
     try {
       const raw = await folium.storage.get(HISTORY_KEY);
       if (raw && typeof raw === 'object') history = normalizeHistory(raw);
+      markFamiliarityDirty();
     } catch (error) {
       log.warn?.('读取听歌历史失败', error);
     }
@@ -185,6 +222,7 @@ export default function activate(folium) {
     }
     trimHistory();
     scheduleSave();
+    markFamiliarityDirty();
     render();
   };
 
@@ -473,6 +511,7 @@ export default function activate(folium) {
     try {
       archiveProfile = await folium.rpc.call('archiveProfile');
       archiveStatusKnown = true;
+      markFamiliarityDirty();
     } catch (error) {
       // 读不到就静默退回本模组自己的记录：联动是增强，不是依赖。
       archiveProfile = null;
@@ -699,7 +738,11 @@ export default function activate(folium) {
       if (!item?.ref) continue;
       const tScore = titleScoreOf(title, item.title ?? '');
       const aScore = artistScoreOf(artist, item.artist ?? '');
-      const score = tScore + aScore;
+      /* 同名多版本时叠加歌手熟悉度：都满足可接受线的前提下，你更常听的
+       * 版本胜出。权重 3/次，既能在两个可接受候选间翻盘，又不会让「歌手
+       * 完全不符」的行靠熟悉度混进来（可接受线先卡住）。 */
+      const fam = familiarityOf(item.artist ?? '');
+      const score = tScore + aScore + Math.min(fam * 3, 45);
       const acceptable = tScore >= 70 || (tScore >= 40 && aScore >= 20) || (tScore >= 30 && aScore >= 30);
       if (acceptable && score > bestScore) {
         bestScore = score;
@@ -938,6 +981,7 @@ export default function activate(folium) {
 
   const clearHistory = async () => {
     history = { v: 1, songs: {}, recent: [] };
+    markFamiliarityDirty();
     try {
       await folium.storage.delete(HISTORY_KEY);
       toast(say.cleared, 'success');
