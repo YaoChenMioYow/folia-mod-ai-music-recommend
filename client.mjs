@@ -744,7 +744,11 @@ export default function activate(folium) {
       const fam = familiarityOf(item.artist ?? '');
       const score = tScore + aScore + Math.min(fam * 3, 45);
       const acceptable = tScore >= 70 || (tScore >= 40 && aScore >= 20) || (tScore >= 30 && aScore >= 30);
-      if (acceptable && score > bestScore) {
+      /* 「版本纠偏」通道：AI 没指名你常听的歌手（或写错了）时，候选若是
+       * 你明显常听的歌手（熟悉度 ≥ 5 次播放），也允许入选——用户说过要
+       * 听谁的版本，比 AI 的原始点名更重要。标题必须高分，防止歌不对。 */
+      const familiarEnough = tScore >= 70 && fam >= 5;
+      if ((acceptable || familiarEnough) && score > bestScore) {
         bestScore = score;
         best = item;
       }
