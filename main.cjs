@@ -225,7 +225,7 @@ const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt
 // ---------------------------------------------------------------- 提示词
 
 /* 听歌档案的紧凑摘要：AI 只需要判断口味，不需要完整数据库。 */
-const buildSourcePrompt = (digest, want, userNote, dislikes) => {
+const buildSourcePrompt = (digest, want, userNote, dislikes, playlists) => {
   const safe = digest && typeof digest === 'object' ? digest : {};
   const lines = [];
 
@@ -259,6 +259,15 @@ const buildSourcePrompt = (digest, want, userNote, dislikes) => {
   }
 
   if (userNote) lines.push('', `用户的额外偏好（优先满足）：${clip(userNote, 200)}`);
+
+  /* 账号歌单：用户自己整理的收藏，是比外部推荐更强的主动信号。 */
+  const playlistSongs = Array.isArray(playlists?.songs) ? playlists.songs.slice(0, 120) : [];
+  const playlistNames = Array.isArray(playlists?.names) ? playlists.names.slice(0, 6) : [];
+  if (playlistSongs.length > 0) {
+    lines.push('', `账号歌单（用户自己收藏的歌${playlistNames.length > 0 ? `，包括「${playlistNames.join('」「')}」` : ''}）：`);
+    playlistSongs.forEach((song) => lines.push(`- ${song.artist ? `${clip(song.artist, 120)}《${clip(song.title, 120)}》` : `《${clip(song.title, 120)}》`}`));
+    lines.push('', '上面的歌单是用户亲口点过头的口味样本：推荐时优先贴合歌单里出现的歌手和曲风；歌单歌手的其它作品（用户还没听过的）是安全的推荐来源。');
+  }
 
   /* 「不感兴趣」清单：显式排除项，优先级高于口味相似性。 */
   const dislikeList = Array.isArray(dislikes) ? dislikes : [];
@@ -397,7 +406,13 @@ module.exports = function activate(api) {
       throw new Error('还没配置密钥：请在「模组面板 → AI 推荐音乐」的「API 密钥」里填写（只保存在本机，加密存放）。');
     }
 
-    const sourcePrompt = buildSourcePrompt(payload?.digest, want, payload?.userNote ?? config.userNote, payload?.dislikes);
+    const sourcePrompt = buildSourcePrompt(
+      payload?.digest,
+      want,
+      payload?.userNote ?? config.userNote,
+      payload?.dislikes,
+      { songs: payload?.playlistSongs, names: payload?.playlistNames },
+    );
 
     api.log.info(`请求 AI 推荐（${model}，要 ${want} 首）`);
 

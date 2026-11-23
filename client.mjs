@@ -102,6 +102,7 @@ export default function activate(folium) {
    *  惰性重建：loadHistory / refreshArchive 后置脏。 */
   let familiarityMap = new Map();
   let familiarityDirty = true;
+  let playlistSongsCache = null;
 
   const markFamiliarityDirty = () => { familiarityDirty = true; };
 
@@ -119,6 +120,10 @@ export default function activate(folium) {
       if (archiveLinked() && archive?.status === 'linked') {
         for (const artist of archive.topArtists ?? []) bump(splitArtists(artist.name), artist.plays ?? 0);
         for (const song of archive.topSongs ?? []) bump(splitArtists(song.a), song.p ?? 0);
+      }
+      // 歌单歌手也算「认识」：在歌单里出现一次记 2 分（弱于真实播放）。
+      if (playlistSongsCache) {
+        for (const song of playlistSongsCache) bump(splitArtists(song.artist), 2);
       }
       familiarityMap = map;
       familiarityDirty = false;
@@ -467,6 +472,16 @@ export default function activate(folium) {
         defaultValue: true,
       },
       {
+        key: 'usePlaylists',
+        type: 'boolean',
+        label: T('联动我的账号歌单', 'Link with my account playlists'),
+        description: T(
+          '拉取你登录的网易云账号的歌单曲目作为推荐依据（只读，不写入）；登录状态或歌单变化后自动生效。',
+          'Reads the playlists of your signed-in NetEase account (read-only) as recommendation input; picks up sign-in changes automatically.',
+        ),
+        defaultValue: true,
+      },
+      {
         key: 'trackHistory',
         type: 'boolean',
         label: T('记录我的听歌历史', 'Track my listening history'),
@@ -490,10 +505,11 @@ export default function activate(folium) {
         autoEnqueue: values.autoEnqueue === true,
         userNote: String(values.userNote ?? '').trim(),
         useArchive: values.useArchive !== false,
+        usePlaylists: values.usePlaylists !== false,
         trackHistory: values.trackHistory !== false,
       };
     } catch {
-      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', useArchive: true, trackHistory: true };
+      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', useArchive: true, usePlaylists: true, trackHistory: true };
     }
   };
 
@@ -622,6 +638,90 @@ export default function activate(folium) {
     const own = buildOwnDigest();
     if (!archiveLinked() || archiveProfile?.status !== 'linked') return own;
     return mergeDigests(own, archiveProfile);
+  };
+
+  // ---------------------------------------------------------------- 账号歌单
+
+  /* 「账号歌单」联动：用 Folium 1.7 的 platform.raw（实验接口，宿主白名单
+   *  放行 user_playlist / playlist_track_all 的只读访问）拉账号歌单曲目，
+   *  作为推荐依据的一部分。登录什么平台、有没有歌单都可能随时变化——每次
+   *  生成前实时拉一次（内存缓存 5 分钟），拿不到就静默跳过。 */
+
+  const PLAYLISTS_TTL_MS = 5 * 60 * 1000;
+  const PLAYLISTS_MAX = 20;         // 最多看这么多张歌单
+  const PLAYLIST_TRACKS_CAP = 100;  // 每张歌单最多取这么多首
+  const PLAYLIST_SONGS_CAP = 120;   // 摘要里最多带这么多首（控制载荷）
+
+  let playlistsCache = { at: 0, profile: null };
+  let playlistsProfile = null;   // 最近一次歌单档案（generate 时刷新，页面只读展示）
+
+  const rawPlatform = () => {
+    try { return folium.experimental?.['platform.raw'] ?? null; } catch { return null; }
+  };
+
+  /** 以当前登录账号调网易云 raw 端点。`selfParam` 端点不带 uid（宿主补）。 */
+  const rawNetease = async (endpoint, params = {}) => {
+    const platform = rawPlatform();
+    if (!platform) throw Object.assign(new Error('no platform.raw'), { code: 'unsupported' });
+    const answer = await platform.request('netease', endpoint, params);
+    return answer?.body;
+  };
+
+  /** 收集账号歌单曲目（聚合去重保序）。任何一步失败都降级为空。 */
+  const collectPlaylistSongs = async () => {
+    const platform = rawPlatform();
+    if (!platform) return { status: 'unsupported', songs: [], playlistNames: [] };
+    try {
+      const body = await rawNetease('user_playlist', {});
+      const playlists = (Array.isArray(body?.playlist) ? body.playlist : [])
+        .filter((pl) => pl && (pl.userId === body?.account?.id || pl.creator?.userId === body?.account?.id))
+        .slice(0, PLAYLISTS_MAX);
+      // 宿主可能不回 account：退化为「凡是自己的 userId 与 creator 一致的」
+      const own = playlists.length > 0 ? playlists : (Array.isArray(body?.playlist) ? body.playlist : []).slice(0, PLAYLISTS_MAX);
+      if (own.length === 0) return { status: 'empty', songs: [], playlistNames: [] };
+
+      const seen = new Set();
+      const songs = [];
+      const playlistNames = [];
+      for (const pl of own) {
+        const plId = String(pl.id ?? '');
+        if (!plId) continue;
+        playlistNames.push(String(pl.name ?? '').slice(0, 60));
+        let trackBody = null;
+        try {
+          trackBody = await rawNetease('playlist_track_all', { id: plId, limit: String(PLAYLIST_TRACKS_CAP) });
+        } catch { continue; }
+        const tracks = Array.isArray(trackBody?.songs) ? trackBody.songs : [];
+        for (const track of tracks) {
+          const id = String(track?.id ?? '');
+          const title = String(track?.name ?? '').trim();
+          if (!id || !title) continue;
+          const key = `netease\u0000${id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          songs.push({
+            id,
+            title: title.slice(0, 200),
+            artist: (Array.isArray(track?.ar) ? track.ar.map((a) => a?.name).filter(Boolean).join(' / ') : '').slice(0, 200),
+          });
+          if (songs.length >= PLAYLIST_SONGS_CAP) break;
+        }
+        if (songs.length >= PLAYLIST_SONGS_CAP) break;
+      }
+      return { status: songs.length > 0 ? 'linked' : 'empty', songs, playlistNames: playlistNames.slice(0, 6) };
+    } catch (error) {
+      const code = String(error?.code ?? error?.message ?? '');
+      log.warn?.('账号歌单拉取失败', error);
+      return { status: code.includes('not-signed-in') || code.includes('auth') ? 'not-signed-in' : 'unavailable', songs: [], playlistNames: [] };
+    }
+  };
+
+  const playlistsProfileOf = async () => {
+    if (!readSettings().usePlaylists) return { status: 'disabled', songs: [], playlistNames: [] };
+    if (playlistsCache.profile && Date.now() - playlistsCache.at < PLAYLISTS_TTL_MS) return playlistsCache.profile;
+    const profile = await collectPlaylistSongs();
+    playlistsCache = { at: Date.now(), profile };
+    return profile;
   };
   // ---------------------------------------------------------------- 结果状态
 
@@ -920,9 +1020,17 @@ export default function activate(folium) {
     statusText = say.generating;
     render();
     try {
-      // 生成前先刷新一次「听歌档案」联动：listening-archive 随时在追加记录。
+      // 生成前先刷新联动数据：听歌档案随时在追加；账号歌单 5 分钟缓存。
       await refreshArchive();
+      playlistsProfile = await playlistsProfileOf();
+      markFamiliarityDirty();
       const digest = buildDigest();
+      if (playlistsProfile?.status === 'linked' && Array.isArray(playlistsProfile.songs)) {
+        playlistSongsCache = playlistsProfile.songs;
+        digest.playlistSongs = playlistsProfile.songs;
+        digest.playlistNames = playlistsProfile.playlistNames ?? [];
+        digest.playlists = { count: playlistsProfile.playlistNames?.length ?? 0, songs: playlistsProfile.songs.length };
+      }
       // 「不感兴趣」作为显式排除项随摘要下发；计数让 AI 知道这是多强的信号。
       const dislikedList = [
         ...Object.entries(dislike.artists).map(([name, e]) => ({ name, count: e.count })),
@@ -941,6 +1049,8 @@ export default function activate(folium) {
         },
         digest,
         dislikes: dislikedList,
+        playlistSongs: playlistsProfile?.status === 'linked' ? playlistsProfile.songs : [],
+        playlistNames: playlistsProfile?.status === 'linked' ? (playlistsProfile.playlistNames ?? []) : [],
       });
       const songs = Array.isArray(answer?.songs) ? answer.songs : [];
       const want = Number.isFinite(cfg.recommendCount) ? Math.max(1, cfg.recommendCount) : 8;
@@ -1445,6 +1555,22 @@ export default function activate(folium) {
         ? tr(`已记录 ${songs.length} 首歌 · 累计播放 ${totalPlays} 次`, `${songs.length} tracks · ${totalPlays} plays`)
         : tr('还没有听歌记录：多听几首，AI 就能认识你的口味', 'No history yet — play a few songs first');
       header.appendChild(stats);
+      // 「账号歌单」联动状态（只在本模组设置开启时展示；profile 由生成时刷新缓存）。
+      if (playlistsProfile?.status && readSettings().usePlaylists) {
+        const plLine = document.createElement('div');
+        plLine.style.cssText = css.dimmer;
+        plLine.textContent = playlistsProfile.status === 'linked'
+          ? tr(
+            `已联动账号歌单：${playlistsProfile.playlistNames?.length ?? 0} 张歌单、${playlistsProfile.songs.length} 首收藏曲目已并入口味档案`,
+            `Account playlists linked: ${playlistsProfile.playlistNames?.length ?? 0} playlists / ${playlistsProfile.songs.length} tracks feed the profile`,
+          )
+          : playlistsProfile.status === 'not-signed-in'
+            ? tr('账号歌单未生效：网易云未登录（登录后自动并入）', 'Account playlists off: NetEase not signed in')
+            : playlistsProfile.status === 'empty'
+              ? tr('账号歌单没有可用曲目', 'No usable tracks in account playlists')
+              : '';
+        if (plLine.textContent) header.appendChild(plLine);
+      }
       // 「听歌档案」联动状态（只在本模组设置开启联动时展示）。
       if (archiveStatusKnown && archiveLinked()) {
         const archiveLine = document.createElement('div');
