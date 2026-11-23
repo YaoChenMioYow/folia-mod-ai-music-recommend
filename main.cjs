@@ -50,6 +50,7 @@ const SYSTEM_PROMPT = [
   '5. 只推荐能在主流音乐平台搜到的正式发行录音室版本；不要现场版、翻唱、remix、纯音乐 BGM、伴奏。',
   '6. 避开过冷门的网络歌曲和小时长的单曲。',
   '7. reason 用中文，说明这首歌为什么适合这位用户（关联到他档案里的哪个歌手/情绪/场景）。',
+  '8. 「用户排除清单」里的歌手和歌曲是用户明确表示不喜欢的，一律不要推荐，也不要推荐与它们高度相似的翻唱/合集版本；清单里的次数是负面反馈的强度，次数多的要特别注意。',
 ].join('\n');
 
 // ---------------------------------------------------------------- 小工具
@@ -257,6 +258,17 @@ const buildSourcePrompt = (digest, want, userNote) => {
   }
 
   if (userNote) lines.push('', `用户的额外偏好（优先满足）：${clip(userNote, 200)}`);
+
+  /* 「不感兴趣」清单：显式排除项，优先级高于口味相似性。 */
+  const dislikes = Array.isArray(payload?.dislikes) ? payload.dislikes : [];
+  const dislikedArtists = dislikes.filter((d) => d?.name);
+  const dislikedSongs = dislikes.filter((d) => d?.title);
+  if (dislikedArtists.length > 0 || dislikedSongs.length > 0) {
+    lines.push('', '用户排除清单（用户明确不喜欢，一律不要推荐，也不要推它们的翻唱/合集版本）：');
+    for (const d of dislikedArtists) lines.push(`- 歌手：${clip(d.name, 120)}（标记 ${Number(d.count) || 1} 次）`);
+    for (const d of dislikedSongs) lines.push(`- 歌曲：${clip(d.artist, 120)}《${clip(d.title, 120)}》`);
+  }
+
   lines.push('', `请推荐 ${want} 首歌。`);
   return lines.join('\n');
 };

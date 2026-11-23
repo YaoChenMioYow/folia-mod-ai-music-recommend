@@ -237,6 +237,118 @@ export default function activate(folium) {
     }
   };
 
+  // ---------------------------------------------------------------- 不感兴趣
+
+  /* 「不感兴趣」：比跳过更强的负反馈。作用两层——
+   *  ① 摘要层：把这些歌手/歌曲作为显式排除项写进提示词，并要求 AI 避开；
+   *  ② 结果层：生成后把命中排除项的新行直接标记为排除（AI 不听话时的保险）。
+   *  歌手级记忆条目带时间戳，超过 DISLIKE_MAX_AGE_MS 的自动失效，避免几年前的
+   *  一次「不喜欢」永久封杀一个歌手。 */
+
+  const DISLIKE_KEY = 'dislike-v1';
+  const DISLIKE_ARTIST_CAP = 60;
+  const DISLIKE_SONG_CAP = 60;
+  const DISLIKE_MAX_AGE_MS = 180 * 24 * 3600 * 1000; // 半年
+  const DISLIKE_SAVE_DEBOUNCE_MS = 1200;
+
+  let dislike = { v: 1, artists: {}, songs: {} };
+  let dislikeTimer = null;
+
+  const normalizeDislike = (raw) => {
+    const now = Date.now();
+    const artists = {};
+    const songs = {};
+    const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    for (const [name, entry] of Object.entries(src.artists ?? {})) {
+      const at = Number(entry?.at) || 0;
+      const count = Number(entry?.count) || 1;
+      if (typeof name === 'string' && name.trim() && now - at < DISLIKE_MAX_AGE_MS) {
+        artists[name.trim().slice(0, 120)] = { at, count };
+      }
+    }
+    for (const [key, entry] of Object.entries(src.songs ?? {})) {
+      const at = Number(entry?.at) || 0;
+      const count = Number(entry?.count) || 1;
+      if (typeof key === 'string' && key.includes('\u0000') && now - at < DISLIKE_MAX_AGE_MS) {
+        songs[key.slice(0, 340)] = { at, count };
+      }
+    }
+    const trimTo = (obj, cap) => {
+      const entries = Object.entries(obj).sort(([, x], [, y]) => y.at - x.at);
+      return Object.fromEntries(entries.slice(0, cap));
+    };
+    return { v: 1, artists: trimTo(artists, DISLIKE_ARTIST_CAP), songs: trimTo(songs, DISLIKE_SONG_CAP) };
+  };
+
+  const loadDislike = async () => {
+    try {
+      const raw = await folium.storage.get(DISLIKE_KEY);
+      dislike = normalizeDislike(raw);
+    } catch (error) { log.warn?.('读取不感兴趣记录失败', error); }
+  };
+
+  const saveDislikeNow = async () => {
+    try { await folium.storage.set(DISLIKE_KEY, dislike); } catch (error) { log.warn?.('不感兴趣记录没写进去', error); }
+  };
+
+  const scheduleDislikeSave = () => {
+    if (dislikeTimer !== null) return;
+    dislikeTimer = setTimeout(() => {
+      dislikeTimer = null;
+      void saveDislikeNow();
+    }, DISLIKE_SAVE_DEBOUNCE_MS);
+  };
+
+  /** 记一次「不感兴趣」：歌名+歌手各记一份（同歌手叠加计数）。
+   *  `artistOnly=true` 时只记歌手（推荐页整行用）。 */
+  const recordDislike = (title, artist, { artistOnly = false } = {}) => {
+    const now = Date.now();
+    for (const name of splitArtists(artist)) {
+      const existing = dislike.artists[name] ?? { at: 0, count: 0 };
+      dislike.artists[name] = { at: now, count: existing.count + 1 };
+    }
+    if (!artistOnly) {
+      const key = `${String(title ?? '').slice(0, 200)}\u0000${String(artist ?? '').slice(0, 140)}`;
+      if (String(title ?? '').trim()) {
+        const existing = dislike.songs[key] ?? { at: 0, count: 0 };
+        dislike.songs[key] = { at: now, count: existing.count + 1 };
+      }
+    }
+    dislike.artists = normalizeDislike(dislike).artists;
+    dislike.songs = normalizeDislike(dislike).songs;
+    scheduleDislikeSave();
+  };
+
+  const dislikeArtistNames = () => Object.keys(dislike.artists);
+
+  /** 新行是否命中排除项（AI 不听话时的结果层保险）。 */
+  const isDisliked = (title, artist) => {
+    const songKey = `${String(title ?? '')}\u0000${String(artist ?? '')}`;
+    if (dislike.songs[songKey]) return true;
+    return splitArtists(artist).some((name) => dislike.artists[name]);
+  };
+
+  /** 最近的排除项（页面上展示「减少推荐」的对象，最多8条）。 */
+  const recentDislikes = () => {
+    const merged = [
+      ...Object.entries(dislike.artists).map(([name, e]) => ({ name, count: e.count, at: e.at, kind: 'artist' })),
+      ...Object.entries(dislike.songs).map(([key, e]) => {
+        const [t, a] = key.split('\u0000');
+        return { name: a ? `${a}《${t}》` : `《${t}》`, count: e.count, at: e.at, kind: 'song' };
+      }),
+    ].sort((x, y) => y.at - x.at);
+    return merged.slice(0, 8);
+  };
+
+  const clearDislike = async () => {
+    dislike = { v: 1, artists: {}, songs: {} };
+    try {
+      await folium.storage.delete(DISLIKE_KEY);
+      toast(tr('已清空全部「不感兴趣」记录', 'All dislikes cleared'), 'success');
+    } catch (error) { log.warn?.('清空不感兴趣记录失败', error); }
+    render();
+  };
+
   // ---------------------------------------------------------------- 设置
 
   const settingsSection = folium.registries.settingsSections.register({
@@ -472,7 +584,6 @@ export default function activate(folium) {
     if (!archiveLinked() || archiveProfile?.status !== 'linked') return own;
     return mergeDigests(own, archiveProfile);
   };
-
   // ---------------------------------------------------------------- 结果状态
 
   /** results 的行：{title, artist, reason, status, song, error, enqueued}
@@ -765,6 +876,14 @@ export default function activate(folium) {
       // 生成前先刷新一次「听歌档案」联动：listening-archive 随时在追加记录。
       await refreshArchive();
       const digest = buildDigest();
+      // 「不感兴趣」作为显式排除项随摘要下发；计数让 AI 知道这是多强的信号。
+      const dislikedList = [
+        ...Object.entries(dislike.artists).map(([name, e]) => ({ name, count: e.count })),
+        ...Object.entries(dislike.songs).map(([key, e]) => {
+          const [t, a] = key.split('\u0000');
+          return { title: t, artist: a, count: e.count };
+        }),
+      ];
       const answer = await folium.rpc.call('recommend', {
         config: {
           apiUrl: cfg.apiUrl,
@@ -774,11 +893,16 @@ export default function activate(folium) {
           userNote: cfg.userNote,
         },
         digest,
+        dislikes: dislikedList,
       });
       const songs = Array.isArray(answer?.songs) ? answer.songs : [];
       const want = Number.isFinite(cfg.recommendCount) ? Math.max(1, cfg.recommendCount) : 8;
-      const rows = sanitizeSongs(songs, want);
+      let rows = sanitizeSongs(songs, want);
       if (rows.length === 0) throw new Error(say.noSongs);
+      // 结果层保险：命中「不感兴趣」的行直接标记（AI 无视排除项时不展示）。
+      rows = rows.map((row) => (isDisliked(row.title, row.artist) ? { ...row, status: 'error', error: tr('命中「不感兴趣」，已排除', 'marked not-interested, excluded') } : row));
+      const usable = rows.filter((row) => row.status !== 'error');
+      if (usable.length === 0) throw new Error(tr('这批推荐全命中「不感兴趣」，已全部排除；请再生成一次', 'Every pick hit a dislike and was excluded; generate again'));
       if (append) {
         // 追加模式：电台在列表尾部续写，页面上能看到推荐不断累积。
         const known = new Set(results.map((row) => `${row.title}\u0000${row.artist}`));
@@ -1532,6 +1656,37 @@ export default function activate(folium) {
         root.appendChild(recentCard);
       }
 
+      // ── 不感兴趣（排除项）
+      const dislikes = recentDislikes();
+      if (dislikes.length > 0) {
+        const dislikeCard = document.createElement('div');
+        dislikeCard.style.cssText = css.card;
+        const dislikeHead = document.createElement('div');
+        dislikeHead.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;';
+        const dislikeTitle = document.createElement('div');
+        dislikeTitle.style.cssText = css.sectionTitle;
+        dislikeTitle.textContent = tr('减少推荐（AI 会避开这些）', 'Fewer like these (avoided by the AI)');
+        dislikeHead.appendChild(dislikeTitle);
+        const clearDislikeBtn = document.createElement('button');
+        clearDislikeBtn.type = 'button';
+        clearDislikeBtn.style.cssText = css.ghostBtn;
+        clearDislikeBtn.textContent = tr('清空', 'Clear');
+        hover(clearDislikeBtn);
+        clearDislikeBtn.addEventListener('click', () => { void clearDislike(); });
+        dislikeHead.appendChild(clearDislikeBtn);
+        dislikeCard.appendChild(dislikeHead);
+        const chips2 = document.createElement('div');
+        chips2.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
+        for (const entry of dislikes) {
+          const chip = document.createElement('span');
+          chip.style.cssText = css.chip;
+          chip.textContent = `${entry.name} ×${entry.count}`;
+          chips2.appendChild(chip);
+        }
+        dislikeCard.appendChild(chips2);
+        root.appendChild(dislikeCard);
+      }
+
       // ── 清除历史
       if (songs.length > 0) {
         const clearBtn = document.createElement('button');
@@ -1713,6 +1868,106 @@ export default function activate(folium) {
     },
   });
 
+  /* 进度条右侧的「不感兴趣」：作用当前歌——记歌名+歌手两层排除，
+   * AI 下次生成时避开；若电台正在跑，还把队列里同一歌手的待播推荐跳过去。 */
+  folium.registries.progressButtons.register({
+    id: 'dislike-toggle',
+    slot: 'progress.trailing',
+    order: 440,
+    mount(container, ctx) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.style.cssText = [
+        'all:unset',
+        'cursor:pointer',
+        'display:flex',
+        'align-items:center',
+        'justify-content:center',
+        'width:24px',
+        'height:24px',
+        'border-radius:7px',
+        'opacity:0.72',
+        'transition:opacity .15s ease,transform .15s ease,color .15s ease',
+        'position:relative',
+      ].join(';');
+      container.appendChild(button);
+
+      let iconEl = null;   // 不能叫 icon——会遮蔽外层的 icon(name,size) 辅助函数
+      /** 当前歌是否已被标记过（画成高亮，可再点一次确认追加计数）。 */
+      const currentMarked = () => {
+        const dto = current?.dto;
+        if (!dto) return false;
+        const songKey = `${dto.title}\u0000${dto.artist}`;
+        return Boolean(dislike.songs[songKey]);
+      };
+      const painter = () => {
+        const colors = ctx.getColors?.() ?? {};
+        const marked = currentMarked();
+        button.title = current?.dto
+          ? tr('不感兴趣：减少这类推荐（歌手 + 这首歌）', 'Not interested: fewer like this (artist + song)')
+          : tr('不感兴趣：先播放一首歌', 'Not interested: play a song first');
+        button.style.color = marked ? '#f87171' : (colors.text || 'currentColor');
+        button.style.opacity = current?.dto ? '0.72' : '0.35';
+        if (iconEl) {
+          iconEl.style.fill = marked ? 'currentColor' : 'none';
+          iconEl.style.stroke = 'currentColor';
+        }
+      };
+
+      void icon('thumbs-down', 15).then((element) => {
+        if (!element) return;
+        iconEl = element;
+        button.replaceChildren(element);
+        painter();
+      }).catch(() => { /* 图标取不到不影响功能 */ });
+
+      button.addEventListener('mouseenter', () => { if (!currentMarked()) button.style.opacity = '1'; });
+      button.addEventListener('mouseleave', () => { if (!currentMarked()) button.style.opacity = '0.72'; });
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        const dto = current?.dto ?? (() => { try { return playback.getState()?.song ? songSnapshot(playback.getState().song) : null; } catch { return null; } })();
+        if (!dto?.title) { toast(tr('没有正在播放的歌', 'Nothing is playing'), 'info'); return; }
+        recordDislike(dto.title, dto.artist);
+        // 立刻落盘一次：用户点了就要生效，不等防抖。
+        void saveDislikeNow();
+        const names = splitArtists(dto.artist).join('、') || dto.title;
+        toast(tr(`已记住：减少「${names}」及其相似歌曲的推荐`, `Noted: fewer recommendations like ${names}`), 'success');
+        render();
+        // 电台运行中：把队列里同一歌手的待播推荐移出去（当前歌不跳）。
+        if (radio && radio.phase === 'active') {
+          try {
+            const head = readQueue();
+            if (head) {
+              const excluded = new Set(splitArtists(dto.artist).map((name) => name.toLowerCase()));
+              const aheadIdx = head.currentIndex + 1;
+              const ahead = head.songs.slice(aheadIdx);
+              const keep = ahead.filter((song) => {
+                const artists = splitArtists(song.artist ?? '').map((name) => name.toLowerCase());
+                return !artists.some((name) => excluded.has(name));
+              });
+              if (keep.length !== ahead.length) {
+                const before = head.songs.slice(0, aheadIdx);
+                const next = uniqueSongs([...before, ...keep]);
+                const result = await replaceQueueSafe(next, head.version);
+                if (result?.status === 'replaced') {
+                  const removed = ahead.length - keep.length;
+                  toast(tr(`电台队列：已移除 ${removed} 首同歌手的待播推荐`, `Radio queue: removed ${removed} pending picks by the same artist`), 'info');
+                }
+              }
+            }
+          } catch (error) { log.warn?.('电台队列清理失败', error); }
+        }
+      });
+      radioListeners.add(painter);
+      painter();
+      try { ctx?.onChange?.(painter); } catch { /* 老宿主没有 onChange */ }
+      return () => {
+        radioListeners.delete(painter);
+        button.remove();
+      };
+    },
+  });
+
   const unsubscribers = [];
   try { unsubscribers.push(folium.events.on('playback.songChanged', onSongChanged)); } catch (error) { log.warn?.('songChanged 监听失败', error); }
   try {
@@ -1728,6 +1983,7 @@ export default function activate(folium) {
   void (async () => {
     await loadHistory();
     await loadResults();
+    await loadDislike();
     await refreshArchive();
     try {
       const song = playback.getState()?.song;
@@ -1749,6 +2005,7 @@ export default function activate(folium) {
       try { off(); } catch { /* 已经没了 */ }
     }
     if (saveTimer !== null) { clearTimeout(saveTimer); saveTimer = null; void saveHistoryNow(); }
+    if (dislikeTimer !== null) { clearTimeout(dislikeTimer); dislikeTimer = null; void saveDislikeNow(); }
     uiListeners.clear();
   };
 }
