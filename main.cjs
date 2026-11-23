@@ -224,7 +224,7 @@ const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt
 // ---------------------------------------------------------------- 提示词
 
 /* 听歌档案的紧凑摘要：AI 只需要判断口味，不需要完整数据库。 */
-const buildSourcePrompt = (digest, want, userNote) => {
+const buildSourcePrompt = (digest, want, userNote, dislikes) => {
   const safe = digest && typeof digest === 'object' ? digest : {};
   const lines = [];
 
@@ -260,9 +260,9 @@ const buildSourcePrompt = (digest, want, userNote) => {
   if (userNote) lines.push('', `用户的额外偏好（优先满足）：${clip(userNote, 200)}`);
 
   /* 「不感兴趣」清单：显式排除项，优先级高于口味相似性。 */
-  const dislikes = Array.isArray(payload?.dislikes) ? payload.dislikes : [];
-  const dislikedArtists = dislikes.filter((d) => d?.name);
-  const dislikedSongs = dislikes.filter((d) => d?.title);
+  const dislikeList = Array.isArray(dislikes) ? dislikes : [];
+  const dislikedArtists = dislikeList.filter((d) => d?.name);
+  const dislikedSongs = dislikeList.filter((d) => d?.title);
   if (dislikedArtists.length > 0 || dislikedSongs.length > 0) {
     lines.push('', '用户排除清单（用户明确不喜欢，一律不要推荐，也不要推它们的翻唱/合集版本）：');
     for (const d of dislikedArtists) lines.push(`- 歌手：${clip(d.name, 120)}（标记 ${Number(d.count) || 1} 次）`);
@@ -396,7 +396,7 @@ module.exports = function activate(api) {
       throw new Error('还没配置密钥：请在「模组面板 → AI 推荐音乐」的「API 密钥」里填写（只保存在本机，加密存放）。');
     }
 
-    const sourcePrompt = buildSourcePrompt(payload?.digest, want, payload?.userNote ?? config.userNote);
+    const sourcePrompt = buildSourcePrompt(payload?.digest, want, payload?.userNote ?? config.userNote, payload?.dislikes);
 
     api.log.info(`请求 AI 推荐（${model}，要 ${want} 首）`);
 
