@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { readArchiveProfileFrom } = require('./archive.cjs');
+const { readStatsProfileFrom } = require('./stats.cjs');
 
 const REQUEST_TIMEOUT_MS = 90000;
 const MAX_TOKENS = 4096;
@@ -368,6 +369,62 @@ const readArchiveProfile = () => {
   return profile;
 };
 
+// ---------------------------------------------------------------- 本地听歌统计联动
+
+// 官方（社区）模组 listening-stats 的聚合位置：<userData>/mod-data/listening-stats/
+// 只读；文件 mtime 没变就直接用上次的聚合结果。
+const STATS_DATA_DIR = ['mod-data', 'listening-stats'];
+
+const statsCache = { signature: null, profile: null };
+
+const statsSignatureOf = (root) => {
+  let signature = '';
+  let latest = 0;
+  let found = 0;
+  const inspect = (rel) => {
+    try {
+      const st = fs.statSync(path.join(root, ...rel));
+      found += 1;
+      latest = Math.max(latest, Math.round(st.mtimeMs));
+    } catch { /* 文件不在：nothing to add */ }
+  };
+  inspect(['agg.json']);
+  inspect(['songs.json']);
+  try {
+    const eventsDir = path.join(root, 'events');
+    for (const name of fs.readdirSync(eventsDir)) {
+      if (!name.toLowerCase().endsWith('.ndjson')) continue;
+      found += 1;
+      try {
+        const st = fs.statSync(path.join(eventsDir, name));
+        latest = Math.max(latest, Math.round(st.mtimeMs));
+      } catch { /* raced */ }
+    }
+  } catch { /* no events dir */ }
+  signature = `${found}@${latest}`;
+  return found > 0 ? signature : null;
+};
+
+const readStatsProfile = () => {
+  const app = electronAppOf();
+  const userData = app?.getPath?.('userData');
+  if (!userData) return { status: 'unavailable', sessions: 0, songs: 0, plays: 0, topArtists: [], topSongs: [], recent: [], skips: [] };
+  const root = path.join(userData, ...STATS_DATA_DIR);
+  const signature = statsSignatureOf(root);
+  if (signature && statsCache.signature === signature && statsCache.profile) {
+    return statsCache.profile;
+  }
+  const profile = readStatsProfileFrom(userData);
+  if (profile.status === 'linked' && signature) {
+    statsCache.signature = signature;
+    statsCache.profile = profile;
+  } else {
+    statsCache.signature = null;
+    statsCache.profile = null;
+  }
+  return profile;
+};
+
 // ---------------------------------------------------------------- 激活
 
 module.exports = function activate(api) {
@@ -388,6 +445,7 @@ module.exports = function activate(api) {
   /* 「听歌档案」联动：渲染进程要摘要时实时来读（mtime 缓存兜底），
    * 不在 activate 时就读——安装与否、有没有记录都可能随时变化。 */
   api.rpc.handle('archiveProfile', () => readArchiveProfile());
+  api.rpc.handle('statsProfile', () => readStatsProfile());
 
   api.rpc.handle('recommend', async (payload) => {
     if (disposed) throw new Error('模组已停用');

@@ -116,12 +116,20 @@ export default function activate(folium) {
         }
       };
       for (const song of Object.values(history.songs ?? {})) bump(splitArtists(song.a), song.p);
-      const archive = archiveProfile;
-      if (archiveLinked() && archive?.status === 'linked') {
-        for (const artist of archive.topArtists ?? []) bump(splitArtists(artist.name), artist.plays ?? 0);
-        for (const song of archive.topSongs ?? []) bump(splitArtists(song.a), song.p ?? 0);
+      let mode = 'all';
+      try { mode = readSettings().dataType; } catch { /* 默认 all */ }
+      if (mode === 'own' || mode === 'all') {
+        for (const song of Object.values(history.songs ?? {})) bump(splitArtists(song.a), song.p);
       }
-      // 歌单歌手也算「认识」：在歌单里出现一次记 2 分（弱于真实播放）。
+      if ((mode === 'archive' || mode === 'all') && archiveLinked() && archiveProfile?.status === 'linked') {
+        for (const artist of archiveProfile.topArtists ?? []) bump(splitArtists(artist.name), artist.plays ?? 0);
+        for (const song of archiveProfile.topSongs ?? []) bump(splitArtists(song.a), song.p ?? 0);
+      }
+      if ((mode === 'stats' || mode === 'all') && statsProfile?.status === 'linked') {
+        for (const artist of statsProfile.topArtists ?? []) bump(splitArtists(artist.name), artist.plays ?? 0);
+        for (const song of statsProfile.topSongs ?? []) bump(splitArtists(song.a), song.p ?? 0);
+      }
+      // 歌单歌手也算「认识」（playlists-only 或开了歌单联动时）：记 2 分（弱于真实播放）。
       if (playlistSongsCache) {
         for (const song of playlistSongsCache) bump(splitArtists(song.artist), 2);
       }
@@ -462,14 +470,21 @@ export default function activate(folium) {
         defaultValue: '',
       },
       {
-        key: 'useArchive',
-        type: 'boolean',
-        label: T('联动「听歌档案」', 'Link with Listening Archive'),
+        key: 'dataType',
+        type: 'select',
+        label: T('推荐依据（听歌数据来源）', 'Recommendation basis (listening data source)'),
         description: T(
-          '检测到官方「听歌档案」模组的记录时，优先用它的长期听歌数据生成推荐（本模组自己的记录会合并进去，不会重复入账）。',
-          'When the official Listening Archive mod has records, they feed the recommendations (merged with this mod’s own records).',
+          '全部合并（默认）：本模组记录 + 「听歌档案」+「本地听歌统计」+ 账号歌单一起用；只选其一时仅用该来源；仅歌单则完全不看听歌记录。',
+          'Merge all (default): this mod’s records + Listening Archive + Listening Stats + account playlists together; pick a single source to use only that; playlists-only ignores listening data.',
         ),
-        defaultValue: true,
+        defaultValue: 'all',
+        options: [
+          { value: 'all', label: T('全部合并', 'Merge all') },
+          { value: 'own', label: T('仅本模组记录', 'This mod only') },
+          { value: 'archive', label: T('仅「听歌档案」', 'Listening Archive only') },
+          { value: 'stats', label: T('仅「本地听歌统计」', 'Listening Stats only') },
+          { value: 'playlists-only', label: T('仅账号歌单', 'Account playlists only') },
+        ],
       },
       {
         key: 'usePlaylists',
@@ -505,11 +520,12 @@ export default function activate(folium) {
         autoEnqueue: values.autoEnqueue === true,
         userNote: String(values.userNote ?? '').trim(),
         useArchive: values.useArchive !== false,
+        dataType: String(values.dataType ?? 'all'),
         usePlaylists: values.usePlaylists !== false,
         trackHistory: values.trackHistory !== false,
       };
     } catch {
-      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', useArchive: true, usePlaylists: true, trackHistory: true };
+      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', dataType: 'all', useArchive: true, usePlaylists: true, trackHistory: true };
     }
   };
 
@@ -522,6 +538,9 @@ export default function activate(folium) {
   /** 「听歌档案」联动状态：null=还没查过；否则是 main 返回的 profile。 */
   let archiveProfile = null;
   let archiveStatusKnown = false;
+  /** 「本地听歌统计」联动状态（同款机制）。 */
+  let statsProfile = null;
+  let statsStatusKnown = false;
 
   const refreshArchive = async () => {
     try {
@@ -533,6 +552,17 @@ export default function activate(folium) {
       archiveProfile = null;
       archiveStatusKnown = false;
       log.warn?.('读取「听歌档案」记录失败', error);
+    }
+  };
+
+  const refreshStats = async () => {
+    try {
+      statsProfile = await folium.rpc.call('statsProfile');
+      statsStatusKnown = true;
+    } catch (error) {
+      statsProfile = null;
+      statsStatusKnown = false;
+      log.warn?.('读取「本地听歌统计」失败', error);
     }
   };
 
@@ -634,10 +664,21 @@ export default function activate(folium) {
     };
   };
 
+  /** 听歌数据源分派：按设置里的 dataType 决定 digest 用哪些来源。
+   *  'playlists-only' 返回空档案（generate 里跳过AI侧听歌依据）。 */
   const buildDigest = () => {
+    const cfg = readSettings();
     const own = buildOwnDigest();
-    if (!archiveLinked() || archiveProfile?.status !== 'linked') return own;
-    return mergeDigests(own, archiveProfile);
+    const mode = cfg.dataType;
+    const merge2 = (a, b) => mergeDigests(a, b);
+    if (mode === 'own') return own;
+    if (mode === 'archive') return archiveProfile?.status === 'linked' ? archiveProfile : { ...own, empty: true, topArtists: [], topSongs: [], recent: [] };
+    if (mode === 'stats') return statsProfile?.status === 'linked' ? statsProfile : { ...own, empty: true, topArtists: [], topSongs: [], recent: [] };
+    // 'all'（默认）：三方合并（各来源缺席时自然跳过；useArchive 旧开关继续管档案那一路）
+    let merged = own;
+    if (archiveLinked() && archiveProfile?.status === 'linked') merged = merge2(merged, archiveProfile);
+    if (statsProfile?.status === 'linked') merged = merge2(merged, statsProfile);
+    return merged;
   };
 
   // ---------------------------------------------------------------- 账号歌单
@@ -717,7 +758,11 @@ export default function activate(folium) {
   };
 
   const playlistsProfileOf = async () => {
-    if (!readSettings().usePlaylists) return { status: 'disabled', songs: [], playlistNames: [] };
+    let usePlaylistsSetting = true;
+    try { usePlaylistsSetting = readSettings().usePlaylists; } catch { /* 默认开 */ }
+    const mode = (() => { try { return readSettings().dataType; } catch { return 'all'; } })();
+    // 「仅歌单」模式下无视 usePlaylists 开关——用户选它就是要用歌单。
+    if (!usePlaylistsSetting && mode !== 'playlists-only') return { status: 'disabled', songs: [], playlistNames: [] };
     if (playlistsCache.profile && Date.now() - playlistsCache.at < PLAYLISTS_TTL_MS) return playlistsCache.profile;
     const profile = await collectPlaylistSongs();
     playlistsCache = { at: Date.now(), profile };
@@ -1021,10 +1066,15 @@ export default function activate(folium) {
     render();
     try {
       // 生成前先刷新联动数据：听歌档案随时在追加；账号歌单 5 分钟缓存。
+      const cfgMode = readSettings().dataType;
       await refreshArchive();
-      playlistsProfile = await playlistsProfileOf();
+      await refreshStats();
       markFamiliarityDirty();
-      const digest = buildDigest();
+      // 数据源选择：仅歌单时完全不看听歌记录。
+      const playlistsOnly = cfgMode === 'playlists-only';
+      playlistsProfile = playlistsOnly || readSettings().usePlaylists ? await playlistsProfileOf() : null;
+      markFamiliarityDirty();
+      const digest = playlistsOnly ? { empty: true, trackedSongs: 0, totalPlays: 0, topArtists: [], topSongs: [], recent: [], skips: [] } : buildDigest();
       if (playlistsProfile?.status === 'linked' && Array.isArray(playlistsProfile.songs)) {
         playlistSongsCache = playlistsProfile.songs;
         digest.playlistSongs = playlistsProfile.songs;
@@ -1555,6 +1605,21 @@ export default function activate(folium) {
         ? tr(`已记录 ${songs.length} 首歌 · 累计播放 ${totalPlays} 次`, `${songs.length} tracks · ${totalPlays} plays`)
         : tr('还没有听歌记录：多听几首，AI 就能认识你的口味', 'No history yet — play a few songs first');
       header.appendChild(stats);
+      // 数据源概览（一行说清当前推荐依据）。
+      {
+        const mode = (() => { try { return readSettings().dataType; } catch { return 'all'; } })();
+        const srcLine = document.createElement('div');
+        srcLine.style.cssText = css.dimmer;
+        const srcName = { all: tr('全部合并', 'merged'), own: tr('仅本模组记录', 'this mod only'), archive: tr('仅「听歌档案」', 'Listening Archive only'), stats: tr('仅「本地听歌统计」', 'Listening Stats only'), 'playlists-only': tr('仅账号歌单', 'playlists only') }[mode] ?? mode;
+        const parts = [];
+        if (mode === 'own' || mode === 'all') parts.push(tr(`本模组 ${songs.length} 首`, `${songs.length} own`));
+        if ((mode === 'archive' || mode === 'all')) parts.push(archiveProfile?.status === 'linked' ? tr(`听歌档案 ${archiveProfile.songs} 首`, `archive ${archiveProfile.songs}`) : tr('听歌档案无记录', 'archive: none'));
+        if ((mode === 'stats' || mode === 'all')) parts.push(statsProfile?.status === 'linked' ? tr(`本地统计 ${statsProfile.songs} 首`, `stats ${statsProfile.songs}`) : tr('本地统计无记录', 'stats: none'));
+        if (mode !== 'playlists-only' && playlistsProfile?.status === 'linked') parts.push(tr(`歌单 ${playlistsProfile.songs.length} 首`, `playlists ${playlistsProfile.songs.length}`));
+        srcLine.textContent = `${tr('推荐依据', 'Basis')}（${srcName}）：${parts.join(' · ') || tr('空', 'empty')}`;
+        header.appendChild(srcLine);
+      }
+
       // 「账号歌单」联动状态（只在本模组设置开启时展示；profile 由生成时刷新缓存）。
       if (playlistsProfile?.status && readSettings().usePlaylists) {
         const plLine = document.createElement('div');
@@ -1900,7 +1965,7 @@ export default function activate(folium) {
     // 打开页面时：刷新「听歌档案」联动状态；有上次的推荐还没在本会话搜索过，
     // 就补搜一轮。注意这里不给 allowAutoEnqueue：只是补齐匹配结果，不悄悄把
     // 旧歌塞进队列。
-    void refreshArchive().then(() => paint());
+    void Promise.all([refreshArchive(), refreshStats()]).then(() => paint());
     if (!resolvedThisSession && results.some((row) => row.status === 'pending')) {
       void resolveAll();
     }
@@ -2160,6 +2225,7 @@ export default function activate(folium) {
     await loadResults();
     await loadDislike();
     await refreshArchive();
+    await refreshStats();
     try {
       const song = playback.getState()?.song;
       if (song?.ref) current = { key: keyOf(songSnapshot(song)), dto: songSnapshot(song), since: Date.now(), counted: true };
