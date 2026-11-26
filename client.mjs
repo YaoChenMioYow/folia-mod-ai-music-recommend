@@ -792,6 +792,11 @@ export default function activate(folium) {
   let clearArmedAt = 0;
   let keyKnown = null;          // null=还没查过；true/false=密钥是否已配置（缓存，避免每次重绘都发 IPC）
 
+  /* AI 实时活动日志：main 在工具循环里推的事件，存环形缓冲，推荐页的日志
+   * 栏渲染。缓冲独立于页面生命周期（页面没开时照样积累，打开就能看到尾巴）。 */
+  const ACTIVITY_CAP = 40;
+  const activityLog = [];   // {text, at} 新的在前
+
   const refreshKeyStatus = async () => {
     keyKnown = await hasKey();
     render();
@@ -1749,6 +1754,46 @@ export default function activate(folium) {
       }
       root.appendChild(card);
 
+      // ── AI 实时日志（验证模式生成时滚动展示；空闲时显示上一轮的尾巴）
+      if (activityLog.length > 0) {
+        const logCard = document.createElement('div');
+        logCard.style.cssText = `${css.card} padding:10px 14px;`;
+        const logHead = document.createElement('div');
+        logHead.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;';
+        const logTitle = document.createElement('div');
+        logTitle.style.cssText = css.sectionTitle;
+        logTitle.textContent = busy ? tr('AI 实时输出', 'AI live output') : tr('AI 输出记录', 'AI output (last run)');
+        logHead.appendChild(logTitle);
+        const clearLogBtn = document.createElement('button');
+        clearLogBtn.type = 'button';
+        clearLogBtn.style.cssText = css.ghostBtn;
+        clearLogBtn.textContent = tr('清空', 'Clear');
+        hover(clearLogBtn);
+        clearLogBtn.addEventListener('click', () => { activityLog.length = 0; render(); });
+        logHead.appendChild(clearLogBtn);
+        logCard.appendChild(logHead);
+
+        const logBox = document.createElement('div');
+        logBox.style.cssText = [
+          'display:flex', 'flex-direction:column', 'gap:2px',
+          'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+          'font-size:11px', 'line-height:1.5',
+          'max-height:180px', 'overflow-y:auto',
+          'padding:8px 10px', 'border-radius:8px',
+          'background:rgba(0,0,0,0.28)',
+        ].join(';');
+        const t0 = activityLog.length > 0 ? activityLog[activityLog.length - 1].at : 0;
+        activityLog.forEach((entry, index) => {
+          const line = document.createElement('div');
+          const t = ((entry.at - t0) / 1000).toFixed(1);
+          line.style.cssText = `white-space:pre-wrap;word-break:break-all;opacity:${Math.max(0.35, 1 - index * 0.04)};`;
+          line.textContent = `[+${t}s] ${entry.text}`;
+          logBox.appendChild(line);
+        });
+        logCard.appendChild(logBox);
+        root.appendChild(logCard);
+      }
+
       // ── 推荐列表
       if (results.length > 0) {
         const listTitle = document.createElement('div');
@@ -2221,6 +2266,42 @@ export default function activate(folium) {
       };
     },
   });
+
+  /* AI 实时活动日志订阅：main 在工具循环里推的事件进环形缓冲，推荐页日志栏渲染。
+   * 缓冲独立于页面生命周期（页面没开时照样积累，打开就能看到尾巴）。 */
+  try {
+    folium.rpc.on('activity-log', (payload) => {
+      const text = String(payload?.text ?? '').slice(0, 200);
+      if (!text) return;
+      activityLog.unshift({ text, at: Number(payload?.at) || Date.now() });
+      if (activityLog.length > ACTIVITY_CAP) activityLog.length = ACTIVITY_CAP;
+      render();
+    });
+  } catch (error) { log.warn?.('活动日志通道注册失败', error); }
+
+  /* 「验证后再推」的搜索通道：main 在工具循环里经 rpc.send 发来搜索请求，
+   * 这里用 omni 执行（只有渲染进程有 omni），再 rpc.call 回填。搜索失败
+   * 返回空列表——让 AI 判定「没搜到」并换歌，而不是让整次生成失败。 */
+  try {
+    folium.rpc.on('tool-search-request', async (payload) => {
+      const callId = String(payload?.callId ?? '');
+      const query = String(payload?.query ?? '').slice(0, 160);
+      const limit = Math.min(12, Math.max(1, Number(payload?.limit) || 8));
+      if (!callId || !query) return { ok: false };
+      let items = [];
+      try {
+        const answer = await folium.omni.searchSongs(query, { limit });
+        items = (Array.isArray(answer?.items) ? answer.items : [])
+          .filter((item) => item?.ref)
+          .slice(0, limit)
+          .map((item) => ({ title: String(item.title ?? '').slice(0, 100), artist: String(item.artist ?? '').slice(0, 100) }));
+      } catch (error) {
+        log.warn?.('验证搜索失败', error);
+      }
+      try { await folium.rpc.call('tool-search-result', { callId, items }); } catch { /* main 已超时放弃 */ }
+      return { ok: true };
+    });
+  } catch (error) { log.warn?.('工具搜索通道注册失败', error); }
 
   const unsubscribers = [];
   try { unsubscribers.push(folium.events.on('playback.songChanged', onSongChanged)); } catch (error) { log.warn?.('songChanged 监听失败', error); }

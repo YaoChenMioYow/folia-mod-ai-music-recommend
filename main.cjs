@@ -246,12 +246,14 @@ const SEARCH_TOOL = Object.freeze({
 
 /* 验证模式的多轮循环。没有 response_format 梯子（工具循环里退避重试会让
  * 上下文混乱），失败直接抛；总轮数与总时长双重上限。 */
-const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, want, signal, log, isDisposed, search }) => {
+const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, want, signal, log, isDisposed, search, emit }) => {
   const messages = [
     { role: 'system', content: `${systemPrompt}\n\n【验证模式】你可以使用 search_songs 工具。硬性要求：最终 JSON 里的每一首歌，都必须在早前的工具调用中确认过「该歌手确实唱过这首歌」。没有验证过的歌不允许出现在结果里。如果连续搜索都找不到某歌手的版本，换别的歌手或别的歌。` },
     { role: 'user', content: sourcePrompt },
   ];
   const MAX_ROUNDS = 8;
+  const say = (text) => { try { emit?.(text); } catch { /* 推送失败不影响生成 */ } log?.info?.(text); };
+  say('开始生成（验证模式）');
   const TOTAL_MS = 150000;
   const startedAt = Date.now();
 
@@ -259,6 +261,7 @@ const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPr
     if (isDisposed?.()) throw new Error('模组已停用');
     if (Date.now() - startedAt > TOTAL_MS) throw new Error(`验证超时（${Math.round(TOTAL_MS / 1000)} 秒内没有完成推荐），请关闭验证模式或减少推荐数量`);
     if (signal?.aborted) throw new Error('模组已停用');
+    say(`第 ${round + 1}/${MAX_ROUNDS} 轮：正在思考…`);
 
     let response;
     try {
@@ -303,10 +306,12 @@ const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPr
       if (!text) {
         throw new Error('AI 返回的内容是空的。');
       }
+      say(`完成：共 ${Math.round((Date.now() - startedAt) / 1000)} 秒`);
       return text;
     }
 
     // 工具轮：逐个执行搜索，把结果回灌
+    say(`AI 请求搜索 ${toolCalls.length} 个验证` + (choice?.finish_reason === 'tool_calls' ? '' : ''));
     messages.push(message);
     for (const call of toolCalls) {
       const fnName = call?.function?.name;
@@ -325,13 +330,15 @@ const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPr
         continue;
       }
       const query = artist ? `${title} ${artist}` : title;
-      log?.info?.(`验证：搜索「${query}」`);
+      say(`搜索「${query}」…`);
+      const tSearch = Date.now();
       const items = await search(query, args.limit);
       // 精简结果：只回给 AI 判断所需的字段，压 token
       const slim = (Array.isArray(items) ? items : []).slice(0, 12).map((item) => ({
         title: clip(item?.title, 100),
         artist: clip(item?.artist, 100),
       }));
+      say(`「${title}」搜到 ${slim.length} 条（${Date.now() - tSearch}ms）` + (slim.length === 0 ? '，没有该歌手的版本' : ''));
       messages.push({
         role: 'tool',
         tool_call_id: call?.id ?? '',
@@ -647,6 +654,7 @@ module.exports = function activate(api) {
           log: api.log,
           isDisposed: () => disposed,
           search: askClientSearch,
+          emit: (text) => { try { api.rpc.send('activity-log', { text: String(text).slice(0, 200), at: Date.now() }); } catch { /* 窗口不在了 */ } },
         });
       } else {
         const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
