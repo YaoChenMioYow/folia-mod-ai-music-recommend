@@ -12,7 +12,7 @@
 // （settingsSections/homeTabs/commands）、ui（toast/icon/openHomeTab）、rpc。
 // 不读宿主内部状态，不碰 localStorage。
 
-const MINOR_REQUIRED = 7;       // 需要 Folium 1.7（Folia 0.7.22 起：secrets / rpc / openHomeTab）
+const MINOR_REQUIRED = 7;       // Folium 1.7 起（Folia 0.7.22+）所需成员才齐；Folium 2.x 全兼容
 const PLAY_MIN_MS = 30000;      // 一首歌听满这么久才算一次有效播放
 const HISTORY_KEY = 'history-v1';
 const RESULTS_KEY = 'results-v1';
@@ -55,8 +55,10 @@ export default function activate(folium) {
   // 老宿主上什么都不注册，免得装出一个按了没反应的模组。
   const major = Number(folium.host?.folium?.major ?? 1);
   const minor = Number(folium.host?.folium?.minor ?? 0);
-  if (major !== 1 || minor < MINOR_REQUIRED) {
-    folium.log?.warn?.(`AI 推荐音乐需要 Folium 1.${MINOR_REQUIRED} 以上（当前 ${major}.${minor}），已跳过激活`);
+  // Folium 1.7+ 与 2.x 都支持：2.x 是 1.x 的超集（本模组用到的成员全部健在），
+  // 旧名（api.storage.data 等）我们从没碰过，deprecated 警告一条也不会有。
+  if (major < 1 || (major === 1 && minor < MINOR_REQUIRED)) {
+    folium.log?.warn?.(`AI 推荐音乐需要 Folium 1.${MINOR_REQUIRED}+ 或 Folium 2.x（当前 ${major}.${minor}），已跳过激活`);
     return () => {};
   }
 
