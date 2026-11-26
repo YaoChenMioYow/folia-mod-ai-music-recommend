@@ -223,9 +223,126 @@ const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt
   throw lastError ?? new Error('请求失败');
 };
 
-// ---------------------------------------------------------------- 提示词
+// ---------------------------------------------------------------- 验证模式
 
-/* 听歌档案的紧凑摘要：AI 只需要判断口味，不需要完整数据库。 */
+/* 工具定义：AI 唯一可用的是 search_songs——在音源里搜歌，用来确认
+ * 「歌手X确实唱过歌Y」。刻意只给一个工具，描述里写死验证语义。 */
+const SEARCH_TOOL = Object.freeze({
+  type: 'function',
+  function: {
+    name: 'search_songs',
+    description: '在用户的音乐音源里搜索歌曲。用途：推荐前验证「某歌手是否真的唱过某首歌」。每次确定一首要推荐的歌曲前，先用歌名+你打算写的歌手名调用本工具；只有结果里出现「该歌手演唱的该歌曲」才允许采纳，否则换一首或换歌手，再次验证。',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '歌名' },
+        artist: { type: 'string', description: '你打算推荐这首歌的哪个歌手的版本' },
+        limit: { type: 'integer', description: '返回条数上限，默认8' },
+      },
+      required: ['title', 'artist'],
+    },
+  },
+});
+
+/* 验证模式的多轮循环。没有 response_format 梯子（工具循环里退避重试会让
+ * 上下文混乱），失败直接抛；总轮数与总时长双重上限。 */
+const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, want, signal, log, isDisposed, search }) => {
+  const messages = [
+    { role: 'system', content: `${systemPrompt}\n\n【验证模式】你可以使用 search_songs 工具。硬性要求：最终 JSON 里的每一首歌，都必须在早前的工具调用中确认过「该歌手确实唱过这首歌」。没有验证过的歌不允许出现在结果里。如果连续搜索都找不到某歌手的版本，换别的歌手或别的歌。` },
+    { role: 'user', content: sourcePrompt },
+  ];
+  const MAX_ROUNDS = 8;
+  const TOTAL_MS = 150000;
+  const startedAt = Date.now();
+
+  for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    if (isDisposed?.()) throw new Error('模组已停用');
+    if (Date.now() - startedAt > TOTAL_MS) throw new Error(`验证超时（${Math.round(TOTAL_MS / 1000)} 秒内没有完成推荐），请关闭验证模式或减少推荐数量`);
+    if (signal?.aborted) throw new Error('模组已停用');
+
+    let response;
+    try {
+      response = await httpFetchOf()(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model, messages, temperature, stream: false, tools: [SEARCH_TOOL], tool_choice: 'auto' }),
+        signal,
+      });
+    } catch (error) {
+      const name = String(error?.name ?? '');
+      const msg = String(error?.message ?? error);
+      throw new Error(
+        isDisposed?.() ? '模组已停用'
+          : (name === 'AbortError' || /abort/i.test(msg)) ? `请求超时（${Math.round(TOTAL_MS / 1000)} 秒上限）`
+            : msg,
+      );
+    }
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      const redact = (t) => String(t).split(apiKey).join('[已隐藏]');
+      throw new Error(`接口返回 ${response.status}：${redact(bodyText).slice(0, 300) || response.statusText}`);
+    }
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (error) {
+      throw new Error(`AI 返回的不是合法 JSON：${describeFailure(error, 15000)}`);
+    }
+    const choice = data?.choices?.[0];
+    const message = choice?.message;
+    const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+
+    if (toolCalls.length === 0) {
+      // 收尾：模型给出最终答案
+      const text = extractContentText(message);
+      if (!text) {
+        throw new Error('AI 返回的内容是空的。');
+      }
+      return text;
+    }
+
+    // 工具轮：逐个执行搜索，把结果回灌
+    messages.push(message);
+    for (const call of toolCalls) {
+      const fnName = call?.function?.name;
+      let args = {};
+      try {
+        args = JSON.parse(call?.function?.arguments ?? '{}');
+      } catch { args = {}; }
+      if (fnName !== 'search_songs') {
+        messages.push({ role: 'tool', tool_call_id: call?.id ?? '', content: JSON.stringify({ error: '未知工具' }) });
+        continue;
+      }
+      const title = clip(args.title, 120);
+      const artist = clip(args.artist, 120);
+      if (!title) {
+        messages.push({ role: 'tool', tool_call_id: call?.id ?? '', content: JSON.stringify({ error: '缺少 title' }) });
+        continue;
+      }
+      const query = artist ? `${title} ${artist}` : title;
+      log?.info?.(`验证：搜索「${query}」`);
+      const items = await search(query, args.limit);
+      // 精简结果：只回给 AI 判断所需的字段，压 token
+      const slim = (Array.isArray(items) ? items : []).slice(0, 12).map((item) => ({
+        title: clip(item?.title, 100),
+        artist: clip(item?.artist, 100),
+      }));
+      messages.push({
+        role: 'tool',
+        tool_call_id: call?.id ?? '',
+        content: JSON.stringify({ query, results: slim, note: slim.length === 0 ? '没有搜到结果：该歌手可能没唱过这首歌，或音源未收录' : '' }),
+      });
+    }
+  }
+  throw new Error(`工具调用轮数达到上限（${MAX_ROUNDS} 轮）还没拿到验证过的推荐；请减少推荐数量或关闭验证模式`);
+};
+
+// ---------------------------------------------------------------- 提示词
 const buildSourcePrompt = (digest, want, userNote, dislikes, playlists) => {
   const safe = digest && typeof digest === 'object' ? digest : {};
   const lines = [];
@@ -447,6 +564,45 @@ module.exports = function activate(api) {
   api.rpc.handle('archiveProfile', () => readArchiveProfile());
   api.rpc.handle('statsProfile', () => readStatsProfile());
 
+  // ---------------------------------------------------------------- 工具调用
+
+  /* 「验证后再推」模式（用户可选开启）：AI 用 search_songs 工具在音源里
+   * 确认“歌手X真的唱过歌Y”后才采纳，从根上消灭幻觉推荐。
+   * 搜索本身只有渲染进程能做（omni 是 client API），所以这里是 main ↔
+   * client 的往返：main 经 rpc.send 发搜索请求 → client 执行 omni 搜索 →
+   * client 经 rpc.call(tool-search-result) 回填；main 的循环以 Map 挂起等
+   * 候。轮数与总时长都有上限，防失控烧 token。 */
+  const TOOL_SEARCH_TIMEOUT_MS = 15000;
+  const pendingSearches = new Map(); // callId -> { resolve }
+  let searchCallSeq = 0;
+
+  api.rpc.handle('tool-search-result', (payload) => {
+    const callId = String(payload?.callId ?? '');
+    const pending = pendingSearches.get(callId);
+    if (!pending) return { ok: false };
+    pendingSearches.delete(callId);
+    clearTimeout(pending.timer);
+    pending.resolve(Array.isArray(payload?.items) ? payload.items : []);
+    return { ok: true };
+  });
+
+  const askClientSearch = (query, limit) => new Promise((resolve) => {
+    if (disposed) { resolve([]); return; }
+    const callId = `s${++searchCallSeq}-${Date.now().toString(36)}`;
+    const timer = setTimeout(() => {
+      pendingSearches.delete(callId);
+      resolve([]);
+    }, TOOL_SEARCH_TIMEOUT_MS);
+    pendingSearches.set(callId, { resolve, timer });
+    try {
+      api.rpc.send('tool-search-request', { callId, query: String(query ?? '').slice(0, 160), limit: clampInt(limit, 1, 12, 8) });
+    } catch {
+      clearTimeout(timer);
+      pendingSearches.delete(callId);
+      resolve([]);
+    }
+  });
+
   api.rpc.handle('recommend', async (payload) => {
     if (disposed) throw new Error('模组已停用');
 
@@ -472,27 +628,46 @@ module.exports = function activate(api) {
       { songs: payload?.playlistSongs, names: payload?.playlistNames },
     );
 
-    api.log.info(`请求 AI 推荐（${model}，要 ${want} 首）`);
+    api.log.info(`请求 AI 推荐（${model}，要 ${want} 首${config.useToolCalls ? '，验证模式' : ''}）`);
 
     const controller = new AbortController();
     inFlight.add(controller);
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let raw;
     try {
-      raw = await requestCompletion({
-        url,
-        apiKey,
-        model,
-        temperature,
-        systemPrompt: SYSTEM_PROMPT,
-        sourcePrompt,
-        signal: controller.signal,
-        log: api.log,
-        isDisposed: () => disposed,
-        timeoutMs: REQUEST_TIMEOUT_MS,
-      });
+      if (config.useToolCalls === true) {
+        raw = await runVerifiedCompletion({
+          url,
+          apiKey,
+          model,
+          temperature,
+          systemPrompt: SYSTEM_PROMPT,
+          sourcePrompt,
+          want,
+          signal: controller.signal,
+          log: api.log,
+          isDisposed: () => disposed,
+          search: askClientSearch,
+        });
+      } else {
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          raw = await requestCompletion({
+            url,
+            apiKey,
+            model,
+            temperature,
+            systemPrompt: SYSTEM_PROMPT,
+            sourcePrompt,
+            signal: controller.signal,
+            log: api.log,
+            isDisposed: () => disposed,
+            timeoutMs: REQUEST_TIMEOUT_MS,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      }
     } finally {
-      clearTimeout(timer);
       inFlight.delete(controller);
     }
 

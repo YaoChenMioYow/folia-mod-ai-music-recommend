@@ -455,6 +455,16 @@ export default function activate(folium) {
         step: 1,
       },
       {
+        key: 'useToolCalls',
+        type: 'boolean',
+        label: T('验证后再推（AI 工具调用）', 'Verify before recommending (AI tool calls)'),
+        description: T(
+          '开启后 AI 会先在音源里搜索确认「这个歌手确实唱过这首歌」再写进推荐，从根上消灭编造的版本；代价是每次生成的 Token 消耗约增加 2–4 倍、耗时更长。默认关闭。',
+          'The AI verifies each pick against your music source before including it, eliminating hallucinated versions. Costs roughly 2–4× more tokens and takes longer. Off by default.',
+        ),
+        defaultValue: false,
+      },
+      {
         key: 'autoEnqueue',
         type: 'boolean',
         label: T('搜索到后自动加入队列', 'Auto enqueue matched songs'),
@@ -524,10 +534,11 @@ export default function activate(folium) {
         useArchive: values.useArchive !== false,
         dataType: String(values.dataType ?? 'all'),
         usePlaylists: values.usePlaylists !== false,
+        useToolCalls: values.useToolCalls === true,
         trackHistory: values.trackHistory !== false,
       };
     } catch {
-      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', dataType: 'all', useArchive: true, usePlaylists: true, trackHistory: true };
+      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', dataType: 'all', useArchive: true, usePlaylists: true, useToolCalls: false, trackHistory: true };
     }
   };
 
@@ -1098,6 +1109,7 @@ export default function activate(folium) {
           temperature: cfg.temperature,
           want: cfg.recommendCount,
           userNote: cfg.userNote,
+          useToolCalls: cfg.useToolCalls === true,
         },
         digest,
         dislikes: dislikedList,
