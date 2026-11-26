@@ -465,6 +465,19 @@ export default function activate(folium) {
         defaultValue: false,
       },
       {
+        key: 'maxRounds',
+        type: 'number',
+        label: T('验证轮数上限', 'Verification round limit'),
+        description: T(
+          '「验证后再推」开启时生效。候选是批量验证的，通常 3–5 轮足够；更复杂的口味可以调高。范围 2–24。',
+          'Applies when verification is on. Candidates are verified in batches; 3–5 rounds is usually enough. Range 2–24.',
+        ),
+        defaultValue: 8,
+        min: 2,
+        max: 24,
+        step: 1,
+      },
+      {
         key: 'autoEnqueue',
         type: 'boolean',
         label: T('搜索到后自动加入队列', 'Auto enqueue matched songs'),
@@ -535,10 +548,11 @@ export default function activate(folium) {
         dataType: String(values.dataType ?? 'all'),
         usePlaylists: values.usePlaylists !== false,
         useToolCalls: values.useToolCalls === true,
+        maxRounds: Math.round(Number(values.maxRounds)),
         trackHistory: values.trackHistory !== false,
       };
     } catch {
-      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', dataType: 'all', useArchive: true, usePlaylists: true, useToolCalls: false, trackHistory: true };
+      return { apiUrl: '', model: '', temperature: 0.8, recommendCount: 8, autoEnqueue: false, userNote: '', dataType: 'all', useArchive: true, usePlaylists: true, useToolCalls: false, maxRounds: 8, trackHistory: true };
     }
   };
 
@@ -1115,6 +1129,7 @@ export default function activate(folium) {
           want: cfg.recommendCount,
           userNote: cfg.userNote,
           useToolCalls: cfg.useToolCalls === true,
+          maxRounds: Number.isFinite(cfg.maxRounds) ? cfg.maxRounds : 8,
         },
         digest,
         dislikes: dislikedList,

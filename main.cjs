@@ -225,36 +225,48 @@ const requestCompletion = async ({ url, apiKey, model, temperature, systemPrompt
 
 // ---------------------------------------------------------------- 验证模式
 
-/* 工具定义：AI 唯一可用的是 search_songs——在音源里搜歌，用来确认
- * 「歌手X确实唱过歌Y」。刻意只给一个工具，描述里写死验证语义。 */
+/* 工具定义：AI 唯一可用的是 search_songs——批量验证「歌手X是否真的唱过歌Y」。
+ * checks 数组一次最多提 20 个候选，避免逐首搜索把轮数耗光。也兼容单个
+ * title/artist 的旧写法（有的模型会无视数组）。 */
 const SEARCH_TOOL = Object.freeze({
   type: 'function',
   function: {
     name: 'search_songs',
-    description: '在用户的音乐音源里搜索歌曲。用途：推荐前验证「某歌手是否真的唱过某首歌」。每次确定一首要推荐的歌曲前，先用歌名+你打算写的歌手名调用本工具；只有结果里出现「该歌手演唱的该歌曲」才允许采纳，否则换一首或换歌手，再次验证。',
+    description: '在用户的音乐音源里批量搜索歌曲。用途：推荐前验证「某歌手是否真的唱过某首歌」。**批量提交**：把你当前想推荐的所有候选（歌名+你打算写的歌手版本）放进 checks 数组一次性验证（最多 20 个），而不是逐首搜索——每首歌的验证结果会按相同顺序返回。只有验证结果里出现「该歌手演唱的该歌曲」的候选才允许写进最终结果，未验证通过的换歌或换歌手后再提交一轮验证。',
     parameters: {
       type: 'object',
       properties: {
-        title: { type: 'string', description: '歌名' },
-        artist: { type: 'string', description: '你打算推荐这首歌的哪个歌手的版本' },
-        limit: { type: 'integer', description: '返回条数上限，默认8' },
+        checks: {
+          type: 'array',
+          description: '要验证的候选列表，最多 20 项',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: '歌名' },
+              artist: { type: 'string', description: '你打算推荐这首歌的哪个歌手的版本' },
+            },
+            required: ['title', 'artist'],
+          },
+        },
+        title: { type: 'string', description: '（单个候选的快捷写法，与 checks 二选一）歌名' },
+        artist: { type: 'string', description: '（单个候选的快捷写法）你打算写的歌手版本' },
+        limit: { type: 'integer', description: '每个候选的返回条数上限，默认8' },
       },
-      required: ['title', 'artist'],
     },
   },
 });
 
 /* 验证模式的多轮循环。没有 response_format 梯子（工具循环里退避重试会让
- * 上下文混乱），失败直接抛；总轮数与总时长双重上限。 */
-const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, want, signal, log, isDisposed, search, emit }) => {
+ * 上下文混乱），失败直接抛；总轮数（用户可配）与总时长双重上限。 */
+const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPrompt, sourcePrompt, want, signal, log, isDisposed, search, emit, maxRounds }) => {
   const messages = [
     { role: 'system', content: `${systemPrompt}\n\n【验证模式】你可以使用 search_songs 工具。硬性要求：最终 JSON 里的每一首歌，都必须在早前的工具调用中确认过「该歌手确实唱过这首歌」。没有验证过的歌不允许出现在结果里。如果连续搜索都找不到某歌手的版本，换别的歌手或别的歌。` },
     { role: 'user', content: sourcePrompt },
   ];
-  const MAX_ROUNDS = 8;
+  const MAX_ROUNDS = clampInt(maxRounds, 2, 24, 8);
   const say = (text) => { try { emit?.(text); } catch { /* 推送失败不影响生成 */ } log?.info?.(text); };
-  say('开始生成（验证模式）');
-  const TOTAL_MS = 150000;
+  say(`开始生成（验证模式，最多 ${MAX_ROUNDS} 轮）`);
+  const TOTAL_MS = Math.max(60000, MAX_ROUNDS * 25000);   // 轮数越多总时长越宽
   const startedAt = Date.now();
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
@@ -310,8 +322,7 @@ const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPr
       return text;
     }
 
-    // 工具轮：逐个执行搜索，把结果回灌
-    say(`AI 请求搜索 ${toolCalls.length} 个验证` + (choice?.finish_reason === 'tool_calls' ? '' : ''));
+    // 工具轮：把每个 tool_call 里的候选展开成搜索任务，并发执行后按原顺序回灌
     messages.push(message);
     for (const call of toolCalls) {
       const fnName = call?.function?.name;
@@ -323,30 +334,58 @@ const runVerifiedCompletion = async ({ url, apiKey, model, temperature, systemPr
         messages.push({ role: 'tool', tool_call_id: call?.id ?? '', content: JSON.stringify({ error: '未知工具' }) });
         continue;
       }
-      const title = clip(args.title, 120);
-      const artist = clip(args.artist, 120);
-      if (!title) {
-        messages.push({ role: 'tool', tool_call_id: call?.id ?? '', content: JSON.stringify({ error: '缺少 title' }) });
+      // 候选展开：checks 数组（批量）或单个 title/artist（旧写法兼容）
+      let checks = Array.isArray(args?.checks)
+        ? args.checks
+            .filter((c) => c && typeof c.title === 'string' && c.title.trim())
+            .slice(0, 20)
+            .map((c) => ({ title: clip(c.title, 120), artist: clip(c.artist, 120) }))
+        : [];
+      if (checks.length === 0 && typeof args?.title === 'string' && args.title.trim()) {
+        checks = [{ title: clip(args.title, 120), artist: clip(args.artist, 120) }];
+      }
+      if (checks.length === 0) {
+        messages.push({ role: 'tool', tool_call_id: call?.id ?? '', content: JSON.stringify({ error: '没有可验证的候选：请传 checks 数组或 title/artist' }) });
         continue;
       }
-      const query = artist ? `${title} ${artist}` : title;
-      say(`搜索「${query}」…`);
+      const perLimit = clampInt(args?.limit, 1, 12, 8);
+      say(`批量验证 ${checks.length} 个候选…`);
       const tSearch = Date.now();
-      const items = await search(query, args.limit);
-      // 精简结果：只回给 AI 判断所需的字段，压 token
-      const slim = (Array.isArray(items) ? items : []).slice(0, 12).map((item) => ({
-        title: clip(item?.title, 100),
-        artist: clip(item?.artist, 100),
-      }));
-      say(`「${title}」搜到 ${slim.length} 条（${Date.now() - tSearch}ms）` + (slim.length === 0 ? '，没有该歌手的版本' : ''));
+      // 并发搜索（复用渲染进程的并发池语义：这里用简单的分批 Promise）
+      const searchOne = async (cand) => {
+        const query = cand.artist ? `${cand.title} ${cand.artist}` : cand.title;
+        try {
+          const items = await search(query, perLimit);
+          const slim = (Array.isArray(items) ? items : []).slice(0, 12).map((item) => ({
+            title: clip(item?.title, 100),
+            artist: clip(item?.artist, 100),
+          }));
+          say(`「${cand.title}」${slim.length > 0 ? `搜到 ${slim.length} 条` : '没有该歌手的版本'}（${Date.now() - tSearch}ms）`);
+          return { query, results: slim, note: slim.length === 0 ? '没有搜到结果：该歌手可能没唱过这首歌，或音源未收录' : '' };
+        } catch (error) {
+          say(`「${cand.title}」搜索失败：${String(error?.message ?? error).slice(0, 60)}`);
+          return { query, results: [], note: '搜索失败，按「未验证通过」处理' };
+        }
+      };
+      // 分 4 路并发，压住 omni 的并发闸门
+      const resultsByIndex = new Array(checks.length);
+      let nextIdx = 0;
+      const worker = async () => {
+        while (nextIdx < checks.length) {
+          const idx = nextIdx++;
+          resultsByIndex[idx] = await searchOne(checks[idx]);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(4, checks.length) }, worker));
+      // 按候选顺序逐个回灌（每个 tool_call 一条 tool 消息）
       messages.push({
         role: 'tool',
         tool_call_id: call?.id ?? '',
-        content: JSON.stringify({ query, results: slim, note: slim.length === 0 ? '没有搜到结果：该歌手可能没唱过这首歌，或音源未收录' : '' }),
+        content: JSON.stringify({ verified: checks.map((c, i) => ({ title: c.title, artist: c.artist, ...resultsByIndex[i] })) }),
       });
     }
   }
-  throw new Error(`工具调用轮数达到上限（${MAX_ROUNDS} 轮）还没拿到验证过的推荐；请减少推荐数量或关闭验证模式`);
+  throw new Error(`工具调用轮数达到上限（${MAX_ROUNDS} 轮）还没拿到验证过的推荐；请增加轮数上限或减少推荐数量`);
 };
 
 // ---------------------------------------------------------------- 提示词
@@ -654,6 +693,7 @@ module.exports = function activate(api) {
           log: api.log,
           isDisposed: () => disposed,
           search: askClientSearch,
+          maxRounds: config.maxRounds,
           emit: (text) => { try { api.rpc.send('activity-log', { text: String(text).slice(0, 200), at: Date.now() }); } catch { /* 窗口不在了 */ } },
         });
       } else {
