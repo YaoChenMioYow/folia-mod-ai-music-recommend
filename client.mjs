@@ -499,8 +499,8 @@ export default function activate(folium) {
         type: 'select',
         label: T('推荐依据（听歌数据来源）', 'Recommendation basis (listening data source)'),
         description: T(
-          '全部合并（默认）：本模组记录 + 「听歌档案」+「本地听歌统计」+ 账号歌单一起用；只选其一时仅用该来源；仅歌单则完全不看听歌记录。',
-          'Merge all (default): this mod’s records + Listening Archive + Listening Stats + account playlists together; pick a single source to use only that; playlists-only ignores listening data.',
+          '全部合并（默认）：本模组记录 + 「听歌档案」+「本地听歌统计」+ 账号歌单一起用——选它就表示允许读取另外两个模组/账号的歌单数据；只选其一时仅用该来源；仅歌单则完全不看听歌记录。',
+          'Merge all (default): this mod’s records + Listening Archive + Listening Stats + account playlists together — choosing it allows reading the other two mods’ and your account’s playlist data; pick a single source to use only that; playlists-only ignores listening data.',
         ),
         defaultValue: 'all',
         options: [

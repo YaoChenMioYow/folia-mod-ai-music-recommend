@@ -14,7 +14,7 @@
     "playback.queue",
     "platform.netease.read"
   ],
-  "folia": ">=0.7.22 <=0.8.99",
+  "folia": ">=0.7.22",
   "experimental": [
     "platform.raw"
   ]
