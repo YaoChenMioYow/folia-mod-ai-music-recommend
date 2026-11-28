@@ -276,6 +276,8 @@ export default function activate(folium) {
     if (!song || !song.ref) { current = null; radioTick(); return; }
     const dto = songSnapshot(song);
     current = { key: keyOf(dto), dto, since: Date.now(), counted: false };
+    // 成功换到新歌：重置连续失败计数。
+    failedStreak = 0;
     // 换歌即检查电台跑道：歌与歌的间隙是补充下一批的最佳时机。
     radioTick();
   };
@@ -1541,6 +1543,40 @@ export default function activate(folium) {
     }
   };
 
+  /* 可播性兜底：宿主播不了某歌（需要会员/试听/下架等）时会发
+   * playback.failed。电台运行中收到失败 → 立刻触发跑道补偿（宿主的
+   * 「无法播放时自动跳过」设置负责跳歌，本模组负责马上补新推荐进队），
+   * 并把这首歌记入排除清单——音源里播不了的就不再推荐。 */
+  let failedStreak = 0;
+  let lastFailedKey = '';
+  const onPlaybackFailed = (payload) => {
+    try {
+      const dto = playback.getState()?.song;
+      if (!dto?.title) return;
+      const key = `${String(dto.title)} ${String(dto.artist)}`;
+      if (key === lastFailedKey) return;
+      failedStreak += 1;
+      lastFailedKey = key;
+      // 只排除「我们自己推荐过的歌」：用户手动放的本地歌/需要登录的歌播不了，
+      // 不是歌手的问题，不该记入排除清单。
+      const isOurPick = results.some((row) =>
+        row.song && String(row.song.title) === String(dto.title) && String(row.song.artist) === String(dto.artist));
+      if (isOurPick) {
+        recordDislike(dto.title, dto.artist);
+        void saveDislikeNow();
+        const row = results.find((r) => r.song && String(r.song.title) === String(dto.title) && String(r.song.artist) === String(dto.artist));
+        if (row) { row.status = 'error'; row.error = tr('音源里无法播放，已记入排除', 'unplayable in source, excluded'); }
+      }
+      if (radio) {
+        toast(tr('这首在音源里播不了，正在补充新推荐…', 'Unplayable here — refilling…'), 'info');
+        void radioTopUp();
+      } else if (isOurPick && failedStreak >= 2) {
+        toast(tr('连续几首推荐都播不了：已记入排除清单，下次推荐会避开', 'Several unplayable picks noted; future picks will avoid them'), 'info');
+      }
+      render();
+    } catch (error) { log.warn?.('处理播放失败事件失败', error); }
+  };
+
   const radioTick = () => {
     if (!radio || disposed) return;
     if (radio.busy || Date.now() < radio.cooldownUntil) return;
@@ -2368,6 +2404,7 @@ export default function activate(folium) {
 
   const unsubscribers = [];
   try { unsubscribers.push(folium.events.on('playback.songChanged', onSongChanged)); } catch (error) { log.warn?.('songChanged 监听失败', error); }
+  try { unsubscribers.push(folium.events.on('playback.failed', onPlaybackFailed)); } catch (error) { log.warn?.('playback.failed 监听失败', error); }
   try {
     unsubscribers.push(folium.every(1000, () => {
       tickPlayback();
